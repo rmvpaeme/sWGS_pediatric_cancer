@@ -1,0 +1,18 @@
+humangenome: "/data/gent/vo/000/gvo00027/RNA_seq_pipeline/resources_Ruben/GRCh38-noaltBisulfite/GRCh38.fa"
+
+PoNichorCNA: "/user/gent/422/vsc42220/20200806_ichorCNA_LR/pon/ichor.PoN.50.500kb_median.rds"
+# from ichorCNA readme: PoNichorCNA: "/user/gent/422/vsc42220/20200428_ichorCNA/ichorCNA/inst/extdata/HD_ULP_PoN_hg38_500kb_median_normAutosome_median.rds"
+
+ichorCNAfolder: "/user/gent/422/vsc42220/20200428_ichorCNA/ichorCNA/inst/extdata/"
+runichorCNA: "/user/gent/422/vsc42220/20200428_ichorCNA/ichorCNA/scripts/runIchorCNA.R"
+
+gcwig: "/user/gent/422/vsc42220/20200428_ichorCNA/ichorCNA/inst/extdata/gc_hg38_500kb.wig"
+mapwig: "/user/gent/422/vsc42220/20200428_ichorCNA/ichorCNA/inst/extdata/map_hg38_500kb.wig"
+hmmcopy: "/data/gent/vo/000/gvo00027/vsc42220/ichorCNA/HMMcopy/bin/readCounter"
+
+wisexref: "/data/gent/vo/000/gvo00027/RNA_seq_pipeline/resources_Ruben/wcX_references/v1.0.2/LQB.GRCh38.200kb.npz"
+blacklist: "/data/gent/vo/000/gvo00027/RNA_seq_pipeline/resources_Ruben/wisecondorX_master/WisecondorX/example.blacklist/centromere.hg38.txt"
+
+wisexkb: 200
+ichorkb: 500
+input: "sWGS"

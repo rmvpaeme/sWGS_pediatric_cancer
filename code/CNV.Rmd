@@ -1,0 +1,2004 @@
+---
+title: "The feasibility of using liquid biopsies as a complementary assay for copy number aberration profiling in routinely collected pediatric cancer patient samples "
+subtitle: "Data analysis"
+author: "Ruben Van Paemel"
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M:%S')`"
+output:
+   html_document:
+      code_download: yes
+      code_folding: hide
+      df_print: paged
+      fig_caption: yes
+      highlight: kate
+      number_sections: yes
+      theme: cosmo
+      toc: yes
+      toc_float: yes
+---
+
+<style>
+body {
+text-align: justify}
+</style>
+
+
+# Introduction
+In our dataset, we have different datatypes:
+
+- Whole genome sequencing at shallow depth (sWGS)
+- Whole Exome Sequencing (WES)
+- Agilent 180K arrays
+- Illumina HumanCytoSNP data
+
+These needs to be harmonised first so that they can be read into R.
+
+## sWGS
+The fastq files were preprocessed with `./code/preprocessing/sWGS_pipeline_SE.snakefile`, which runs bwa-mem, picard markduplicates and WisecondorX/ichorCNA. The output (`bins.bed`, `segments.bed`) from WisecondorX were further used in the downstream processing. The reference for WisecondorX was generated from an in-house dataset of healthy volunteers. More information on how to obtain a reference dataset for WisecondorX is available at https://github.com/CenterForMedicalGeneticsGhent/WisecondorX. The PoN and supporting files for ichorCNA were obtained from the ichorCNA repository (https://github.com/broadinstitute/ichorCNA).
+
+## WES
+The fastq files were preprocessed with `./code/preprocessing/sWGS_pipeline_PE.snakefile`, which runs bwa-mem, picard markduplicates and WisecondorX/ichorCNA. 
+
+CNVkit was run with the parameters described in `cnvkit.sh` on the deduplicated bam files with the paired germline sample. Target region bed files (e.g. SureSelect) was downloaded from the Agilent website. The link between the ID from germline WES and ID from tumor WES is also in the `cnvkit.sh` file. 
+
+## Illumina HumanCytoSNP
+Illumina Genomestudio 2.0 (https://www.illumina.com/techniques/microarrays/array-data-analysis-experimental-design/genomestudio.html) was used to obtain the log2ratio (Robs/Rexp) per bin from the IDAT files. The SampleSheets are available in `./resources/`. The other files (`.egt` and `.bpm`) are too large to host here and are available on the Illumina website (e.g. https://emea.support.illumina.com/downloads/humancytosnp-12v2-1_product_files-ns.html)
+
+## Agilent 180K array
+Raw data for the Agilent 180K arrays was not available. The processed data (`sample_raw.csv`) was used for downstream processing. The data was processed according to the methods in https://pubmed.ncbi.nlm.nih.gov/23308108/. 
+
+## Integrating the different platforms
+`./code/convertRaw.snakefile`: converts data from obtained from WES, sWGS, Illumina HumanCytoSNP-12 or 180K array (Agilent) into a structure that allows the comparison of these different data-types, and harmonises the bin size between all data types. Also uses DNAcopy to obtain segmentations. If necessary (i.e. array data), the files are liftover to GRCh38.
+
+Example input files are present in the `./examples/` folder. 
+
+## Other scripts
+`./code/makeBins.sh` obtain bins of choice starting from `.fa.fai` file, is a dependency of `./code/convertRaw.snakefile`
+
+`./code/DNAcopy_segment.R`: runs DNAcopy, is a dependency of `./code/convertRaw.snakefile`
+
+## Load dependencies and packages
+```{r, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, cache = TRUE)
+library(tidyverse)
+library(wesanderson)
+library(ggpubr)
+library(zoo)
+library(readxl)
+library(reshape2)
+library(ComplexHeatmap)
+library(queensgambit) #https://github.com/rmvpaeme/queensgambit
+library(circlize)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggridges)
+library(ggupset)
+library(conflicted)
+library(sjPlot)
+library(ggrepel)
+library(DT)
+conflict_prefer("filter", "dplyr")
+
+options(scipen=999)
+colortheme <- c(wes_palette("Cavalcanti1")[1], wes_palette("Cavalcanti1")[4])
+
+chr_order <- c("1", "2", "3", "4", "5", "6", "7", "8",
+               "9", "10", "11", "12", "13", "14", "15",
+               "16", "17", "18", "19", "20", "21", "22", "X", "Y")
+
+datadir_sWGS_cfDNA <- "./data/sWGS_cfDNA/"
+datadir_sWGS_tissue <- "./data/sWGS_tissue/"
+datadir_arrayBE <- "./data/array/"
+datadir_arrayCZ <- "./data/SNParray/"
+datadir_WES <- "./data/WES_FR/"
+datadir_healthy <- "./data/sWGS_healthy/"
+plotfolder <- "./plots_paper/"
+```
+
+```{r}
+# the original CPA from Raman et al.
+get.cpa <- function(seg){
+   cpa <- sum(abs(seg$zscore) * (seg$end - seg$start  + 1)) / nrow(seg) * 1e-8 # per 100 Mb
+   return(cpa)
+}
+
+# The modified CPA score (CPAm)
+get.cpa.modified2 <- function(seg){
+   cpa <- sum(abs(seg$ratio) * (seg$end - seg$start + 1)) / 1e8
+   return(cpa)
+}
+
+makeCNVcomparison <- function(datadir1, datadir2, sample1, sample2, patientID, uniqueID, binsize, tumor_input, tumortype, tissueplatform){
+   
+   print(paste0("cfDNA sample: ", sample1))
+   print(paste0("tumorDNA sample: ", sample2))
+   print(paste0("binsize: ", binsize))
+   
+   
+   bins_top <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "bins_mask")), col_types = c("fdd?d"),
+                        col_names = c("chr", "start", "end", "id", "ratio"), skip = 1)
+   bins_top <- bins_top %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   
+   segs_top <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "segments_mask.bed")), col_types = c("fdddd"),
+                        col_names = c("chr", "start", "end", "ratio", "zscore"))
+   segs_top <- segs_top %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample1)
+   
+   if (tumor_input == "array_BE" | tumor_input == "array_CZ" | tumor_input == "WES_FR" ){
+      bins_bottom <-  read_tsv(paste0(datadir2,"/",sample2,"_", binsize, ".tsv"), col_types = c("fddd"),
+                               col_names = c("chr", "start", "end", "ratio"))
+      bins_bottom <- bins_bottom %>% filter(!chr %in% c("X", "Y", "23", "24"))
+      bins_bottom$chr <- factor(bins_bottom$chr, levels = chr_order)
+      
+      segs_bottom <- read_tsv(paste0(datadir2,"/",sample2,"_", binsize, "_segments.tsv"), col_types = c("fddd"),
+                              col_names = c("chr", "start", "end", "ratio"), skip = 1)
+      
+      segs_bottom <- segs_bottom %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample2)
+      segs_bottom$chr <- factor(segs_bottom$chr, levels = chr_order)
+   } else if (tumor_input == "sWGS"){
+      bins_bottom <-  read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample2), "bins_mask")), col_types = c("fdd?d"),
+                               col_names = c("chr", "start", "end", "id", "ratio"))
+      bins_bottom <- bins_bottom %>% filter(!chr %in% c("X", "Y", "23", "24"))
+      bins_bottom$chr <- factor(bins_bottom$chr, levels = chr_order)
+      
+      segs_bottom <- read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample2), "segments_mask.bed")), col_types = c("fdddd"),
+                              col_names = c("chr", "start", "end", "ratio", "zscore"))
+      segs_bottom <- segs_bottom %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample2)
+      segs_bottom$chr <- factor(segs_bottom$chr, levels = chr_order)
+   }
+   
+   color_top <- wes_palette("Cavalcanti1")[1]
+   color_bottom <- "#5E81AC" #wes_palette("Cavalcanti1")[4]
+   color_abberations <- wes_palette("Cavalcanti1")[5]
+   
+   max.ratio_bins <- max(c(bins_top$ratio, bins_bottom$ratio), na.rm = TRUE)
+   min.ratio_bins <- min(c(bins_top$ratio, bins_bottom$ratio), na.rm = TRUE)
+   
+   max.ratio_bins.top <- max(c(bins_top$ratio), na.rm = TRUE)
+   min.ratio_bins.top <- min(c(bins_top$ratio), na.rm = TRUE)
+   
+   max.ratio_bins.bottom <- max(c(bins_bottom$ratio), na.rm = TRUE)
+   min.ratio_bins.bottom <- min(c(bins_bottom$ratio), na.rm = TRUE)
+   
+   
+   if (tumor_input == "sWGS"){
+      cpa_top <- round(get.cpa(segs_top),4)
+      cpa_bottom <- round(get.cpa(segs_bottom),4)
+      cpa_top <- round(get.cpa.modified2(segs_top),4)
+      cpa_bottom <- round(get.cpa.modified2(segs_bottom),4)
+      cpa.calc <- "CPAm"
+   } else{
+      cpa_top <- round(get.cpa.modified2(segs_top),4)
+      cpa_bottom <- round(get.cpa.modified2(segs_bottom),4)
+      cpa.calc <- "CPAm"
+   }
+   
+   if (tumortype == "neuroblastoma"){
+      # add MYCN region
+      nbl_1 <- geom_segment(data = segs_top %>% filter(chr == "2"), aes(x=15940550, xend=15947004, y=-Inf, yend=Inf), col = "grey", alpha = 0.4) 
+      nbl_2 <- geom_text(data = segs_top %>% filter(chr == "2"), label = "MYCN", x=65947004, y=max.ratio_bins*0.9, angle = 90, alpha = 0.4, size = 3, color = "grey")
+   } else {
+      nbl_1 <- NULL
+      nbl_2 <- NULL
+   }
+   
+   ptop <- ggplot(bins_top, aes(x = start, y = ratio)) + 
+      theme_bw() + 
+      labs(title = paste0(patientID, " - sWGS cfDNA - ", sample1, " - ", cpa.calc,": ", cpa_top, " - ", tumortype), y = "log2(ratio)") + 
+      geom_point(size = 0.3, col = color_top, alpha = 0.7) +
+      lims(y = c(min.ratio_bins,max.ratio_bins))+
+      theme(panel.spacing.x = unit(0, "lines"),
+            panel.spacing.y = unit(0, "lines"),
+            axis.title.x =  element_blank(),
+            axis.text.x =  element_blank(),
+            axis.ticks.x =  element_blank(),
+            strip.background = element_rect(color = "white", fill = "white"),
+            #   panel.border = element_rect(color = "gray", fill = NA, size = 0.3), 
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank()) + 
+      geom_hline(yintercept = 0, linetype = "dashed", col = "gray") +
+      facet_wrap(~chr, strip.position = "bottom", scales ="free_x", nrow = 1) + 
+      geom_segment(data = segs_top, aes(x = start, xend = end, y = ratio , yend = ratio), col = color_abberations) +
+      geom_rect(data = segs_top, aes(xmin=start, xmax=end, ymin=0, ymax=ratio), fill = color_abberations, alpha = 0.4) + nbl_1 + nbl_2
+   
+   
+   pbottom <- ggplot(bins_bottom, aes(x = start, y = ratio)) + 
+      theme_bw() + 
+      labs(title = paste0(patientID, " - ", tissueplatform, " tissue - ", sample2, " - ",cpa.calc, ": ", cpa_bottom, " - ", tumortype), y = "log2(ratio)") +  
+      geom_point(size = 0.3, col = color_bottom, alpha = 0.7) +
+      lims(y = c(min.ratio_bins,max.ratio_bins))+
+      theme(panel.spacing.x = unit(0, "lines"),
+            panel.spacing.y = unit(0, "lines"),
+            axis.title.x =  element_blank(),
+            axis.text.x =  element_blank(),
+            axis.ticks.x =  element_blank(),
+            strip.background = element_rect(color = "white", fill = "white"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank()) + 
+      geom_hline(yintercept = 0, linetype = "dashed", col = "gray") +
+      facet_wrap(~chr, strip.position = "bottom", scales ="free_x", nrow = 1) +
+      geom_segment(data = segs_bottom, aes(x = start, xend = end, y = ratio , yend = ratio), col = color_abberations) +
+      geom_rect(data = segs_bottom, aes(xmin=start, xmax=end, ymin=0, ymax=ratio), fill = color_abberations, alpha = 0.4) + nbl_1 + nbl_2
+   
+   
+   corplot_df_bins <- inner_join(bins_top, bins_bottom, by = c("chr", "start", "end"))
+   #corplot_df <- corplot_df %>% filter(!is.na(ratio.x) & !is.na(ratio.y))
+   
+   corplot_df_bins <- corplot_df_bins %>%
+      mutate(rM.top=rollapply(ratio.x,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) %>%
+      mutate(rM.bottom=rollapply(ratio.y,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) 
+   
+   rollmean <- ggplot(tibble(corplot_df_bins), aes(x = start)) + 
+      theme_bw() + 
+      labs(y = "log2(ratio)", x = "chromosomes") +
+      geom_line(aes(y=rM.bottom), col = color_bottom, alpha = 1, size = 1) +
+      geom_line(aes(y=rM.top), col = color_top, alpha = 0.7, size = 1) +
+      theme(panel.spacing.x = unit(0, "lines"),
+            panel.spacing.y = unit(0, "lines"),
+            #  axis.title.x =  element_blank(),
+            axis.text.x =  element_blank(),
+            axis.ticks.x =  element_blank(),
+            strip.background = element_rect(color = "white", fill = "white"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank()) + 
+      geom_hline(yintercept = 0, linetype = "dashed", col = "gray") +
+      facet_wrap(~chr, strip.position = "bottom", scales ="free_x", nrow = 1) + lims(y = c(-NA,NA))+ nbl_1
+   
+   max.ratio <- max(c(corplot_df_bins$ratio.x, corplot_df_bins$ratio.y), na.rm = TRUE)
+   min.ratio <- min(c(corplot_df_bins$ratio.x, corplot_df_bins$ratio.y), na.rm = TRUE)
+   corplot <- ggplot(corplot_df_bins, aes(x = ratio.x, y = ratio.y)) + 
+      geom_point(size = 0.3, col = wes_palette("Royal1")[1]) + 
+      theme_bw() +
+      geom_abline(slope = 1, intercept = 0) +
+      stat_cor(method = "pearson", aes(label = ..r.label..)) +
+      geom_smooth(method = "lm", col = color_abberations, linetype = "dashed") +
+      lims(x = c(min.ratio , max.ratio), y = c(min.ratio, max.ratio)) + 
+      labs(x = "log2(ratio) cfDNA", y = "log2(ratio) tissue") +
+      theme(axis.title.x = element_text(color = color_top),
+            axis.title.y = element_text(color = color_bottom))
+   
+   R <- cor(corplot_df_bins$ratio.x, corplot_df_bins$ratio.y, use = "complete.obs", method = "pearson")
+   
+   CNVplot <- ggarrange(ptop, pbottom, nrow = 2, ncol = 1, align = "v", heights = c(1, 1))
+   comparisons <- ggarrange(rollmean, corplot, nrow = 1, ncol = 2, widths = c(0.7, 0.3))
+   
+   arrangeplot <- ggarrange(CNVplot, comparisons, nrow = 2, heights = c(0.75, 0.25), widths = c(1, 0.90), align = "hv")
+   ggsave(paste0(plotfolder, patientID, "_", sample1, "_", sample2, "_", binsize, ".png"), plot = arrangeplot, width = 11, height = 9, dpi = 300)
+   
+   df_comparison <- data.frame(UniqueID = c(uniqueID), PatientID = c(patientID), CFD_ID = c(sample1), tumorDNA_ID = c(sample2), pearsonR = c(R), cpa_cfDNA = c(cpa_top), cpa_tumorDNA = c(cpa_bottom), cpa_type = c(cpa.calc))
+   return(df_comparison)
+}
+```
+
+# Sample annotation
+The sample annotation is read from the `xlsx file`.
+
+```{r}
+#sample_annotation_a <- read_excel("/Users/rmvpaeme/Dropbox (speleman lab)/Basecamp/CVP/LQB pediatric patients/analysis_RVP/sample_annotation.xlsx")
+sample_annotation <- read_csv("/Users/rmvpaeme/Dropbox (speleman lab)/Basecamp/CVP/LQB pediatric patients/analysis_RVP/20210705_sample_annotation_filtered_update.csv")
+#sample_annotation <- left_join(sample_annotation_b, sample_annotation_a %>% select(UniqueID, date_of_blood_draw, date_of_tissue_collection ))
+
+
+sample_annotation$date_of_blood_draw <- as.Date(sample_annotation$date_of_blood_draw, "%d/%m/%Y")
+sample_annotation$date_of_tissue_collection <- as.Date(sample_annotation$date_of_tissue_collection, "%d/%m/%Y")
+
+sample_annotation$delta_tissue_liquid <- sample_annotation$date_of_tissue_collection - sample_annotation$date_of_blood_draw 
+sample_annotation <- sample_annotation %>% select(-c(date_of_blood_draw, date_of_tissue_collection))
+#sample_annotation <- merge(sample_annotation, sample_annotation_a %>% select(UniqueID, hospital))4
+
+excl <- sample_annotation %>% nrow() - sample_annotation %>% filter((delta_tissue_liquid <= 31 & delta_tissue_liquid >= -31) | delta_tissue_liquid == "NA") %>% nrow()
+
+print(paste0("samples excluded because of time delay: ", excl))
+
+sample_annotation <- sample_annotation %>% filter((delta_tissue_liquid <= 31 & delta_tissue_liquid >= -31) | delta_tissue_liquid == "NA")
+
+write_csv(sample_annotation, "20210705_supplemental_table1.csv")
+
+sample_annotation <- sample_annotation %>% filter(cfDNA_data_available == "TRUE" & tumorDNA_data_available == "TRUE")
+
+sample_annotation_full <- sample_annotation
+sample_annotation$filtersample <- as.logical(sample_annotation$filtersample)
+sample_annotation <- sample_annotation %>% filter(is.na(filtersample))
+
+
+sample_annotation$TumorGroup <- ifelse(
+   sample_annotation$TumorType %in% c("Ewing sarcoma", "osteosarcoma"),
+   "bone tumor",
+   ifelse(
+      sample_annotation$TumorType %in% c(
+         "nephroblastoma",
+         "malignant rhabdoid tumor of the kidney",
+         "renal cell carcinoma",
+         "kidney sarcoma"
+      ),
+      "kidney tumor",
+      ifelse(
+         sample_annotation$TumorType %in% c("neuroblastoma", "ganglioneuroblastoma"),
+         "neuroblastoma",
+         ifelse(
+            sample_annotation$TumorType %in% c("rhabdomyosarcoma"),
+            "rhabdomyosarcoma", "brain tumor"
+         )
+      )
+   )
+)
+
+
+sample_annotation$TumorAbbrev <- sample_annotation$TumorType
+sample_annotation$TumorAbbrev  <- gsub("Ewing sarcoma", "EWS", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("osteosarcoma", "OS", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("astrocytic pilocytoma", "ASP", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("ependymoma", "EPA", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("ganglioglioma", "GGA", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("ganglioneuroblastoma", "GNA", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("glioblastoma", "GBA", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("hemangioblastoma", "HGA", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("kidney sarcoma", "KS", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("meningioma", "MGA", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("malignant rhabdoid tumor of the kidney", "MRT", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("nephroblastoma", "NFB", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("neuroblastoma", "NBL", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("renal cell carcinoma", "RCC", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("rhabdomyosarcoma", "RMS", sample_annotation$TumorAbbrev)
+sample_annotation$TumorAbbrev  <- gsub("medulloblastoma", "MBL", sample_annotation$TumorAbbrev)
+
+sample_annotation$cfDNA_HMW_ratio <- as.numeric(sample_annotation$cfDNA_prct_conc)/as.numeric(sample_annotation$HMW_prct_conc)
+sample_annotation$cfDNA_HMW_ratio <- as.numeric(sample_annotation$cfDNA_HMW_ratio)
+
+
+sample_annotation$quality_score <- ifelse(sample_annotation$cfDNA_HMW_ratio < 1, "low",
+                                          ifelse(sample_annotation$cfDNA_HMW_ratio < 5 & sample_annotation$cfDNA_HMW_ratio > 1, "medium", "high"))
+
+sample_annotation$cfDNA_prct <- as.numeric(sample_annotation$cfDNA_prct_conc)/(as.numeric(sample_annotation$HMW_prct_conc)+as.numeric(sample_annotation$cfDNA_prct_conc))
+sample_annotation$cfDNA_HMW_ratio <- as.numeric(sample_annotation$cfDNA_HMW_ratio)
+
+
+tumorSamples <- sample_annotation %>% select(UniqueID, PatientID, tumorDNA_ID, TumorType,tumorDNA_assay,tumorDNA_assay_detail, tumorDNA_biomaterial, TumorGroup,cfDNA_HMW_ratio, delta_tissue_liquid )
+colnames(tumorSamples) <- c("UniqueID", "PatientID",  "SampleID", "TumorType", "assay", "assayDetail", "source", "TumorGroup", "cfDNA_HMW_ratio", "delta_tissue_liquid")
+tumorSamples$biomaterial <- "tumor DNA"
+
+cfDNASamples <-  sample_annotation %>% select(UniqueID, PatientID, CFD_ID, TumorType,tumorDNA_assay,tumorDNA_assay_detail, CFD_biomaterial, TumorGroup, cfDNA_HMW_ratio, delta_tissue_liquid) 
+colnames(cfDNASamples) <- c("UniqueID", "PatientID",  "SampleID", "TumorType", "assay", "assayDetail", "source", "TumorGroup", "cfDNA_HMW_ratio", "delta_tissue_liquid")
+cfDNASamples$assay <- "sWGS"
+cfDNASamples$assayDetail <- "sWGS"
+cfDNASamples$biomaterial <- "cfDNA"
+
+sample_annotation_long <- bind_rows(tumorSamples, cfDNASamples)
+
+sample_annotation[1:6,1:6]
+```
+
+# Femto PULSE figures
+A representative electropherogram is shown here from each of the three categories (cfDNA/HMW ratio < 1, cfDNA/HMW ratio between 1 and 5 and cfDNA/HMW ratio > 5).
+
+```{r}
+df_a <- read_csv("./data/FEMTO/2019 03 06 18H 06M Electropherogram.csv")
+df_a$sample <- "cfDNA/HMW ratio [1,5) = 4.00"
+#df_a$sample <- "CFD1806872"
+colnames(df_a) <- c("Size (bp)", "RFU", "sample")
+
+
+df_b <- read_csv("./data/FEMTO/2019 03 06 22H 35M Electropherogram.csv")
+#df_b$sample <- "CFD1601677"
+df_b$sample <- "cfDNA/HMW ratio [5,∞) = 37.50"
+colnames(df_b) <- c("Size (bp)", "RFU", "sample")
+
+df_c <- read_csv("./data/FEMTO/2019 03 06 23H 42M Electropherogram.csv")
+#df_c$sample <- "CFD1600800"
+df_c$sample <- "cfDNA/HMW ratio [0,1) = 0.78"
+colnames(df_c) <- c("Size (bp)", "RFU", "sample")
+
+df_size <- rbind(df_a, df_b, df_c)
+ggplot(df_size, aes(y = `RFU`, x = `Size (bp)`, col = sample)) + geom_line() + scale_x_continuous(trans = "log10", breaks = c(100, 250, 700, 2500, 6000), limits = c(70,12000)) + theme_bw() + facet_wrap(~sample, scales = "free_y") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + geom_vline(xintercept = 700, linetype = "dashed", color = "grey") + guides(col = FALSE) + scale_color_manual(values = qg_palette("USopen")[1:3])
+ggsave(paste0(plotfolder, "FP_ratios.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 4)
+ggsave(paste0(plotfolder, "FP_ratios.png"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 4)
+ggsave(paste0(plotfolder, "FP_ratios.svg"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 4)
+```
+
+
+# Reading in all data
+While reading in the data, the loop makes a comparative figure for every comparison in sample_annotation, for example:
+
+![comparison](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots/patient_039_CFD1802282_DNA044085_200kb.png)
+
+```{r}
+
+if (!file.exists("./data/compareAll_paper.tsv")){
+   cfDNAvsTissue <- data.frame()
+   #sample_annotation <- sample_annotation  %>% filter(SampleOrigin == "MH")
+   for (row in 1:nrow(sample_annotation)){
+      sample1 <- sample_annotation[row,]$CFD_ID
+      sample2 <- sample_annotation[row,]$tumorDNA_ID
+      patientID <-  sample_annotation[row,]$PatientID
+      uniqueID <-  sample_annotation[row,]$UniqueID
+      tissueplatform <- sample_annotation[row,]$tumorDNA_assay_detail
+      tumortype <- sample_annotation[row,]$TumorType
+      datadir1 <- datadir_sWGS_cfDNA
+      if (sample_annotation[row,]$tumorDNA_assay == "array_BE"){
+         input_tumor = "array_BE"
+         datadir2 <-  datadir_arrayBE
+      } else if (sample_annotation[row,]$tumorDNA_assay == "array_CZ"){
+         input_tumor = "array_CZ"
+         datadir2 <-  datadir_arrayCZ
+      } else if (sample_annotation[row,]$tumorDNA_assay == "WES_FR"){
+         input_tumor = "WES_FR"
+         datadir2 <-  datadir_WES
+      } else if (sample_annotation[row,]$tumorDNA_assay == "sWGS"){
+         input_tumor = "sWGS"
+         datadir2 <-  datadir_sWGS_tissue
+      }
+      if (length(dir(datadir2, pattern = sample2) > 0  | length(dir(datadir1, pattern = sample1) > 0))) {
+         tmp <- makeCNVcomparison(datadir1, datadir2, sample1, sample2, patientID, uniqueID, "200kb", input_tumor, tumortype,tissueplatform)
+         cfDNAvsTissue <- rbind(cfDNAvsTissue, tmp)
+      }
+      print(paste0("Processed: ", row, "/", nrow(sample_annotation)))
+   }
+   write_tsv(cfDNAvsTissue, "./data/compareAll_paper.tsv")
+} else {
+   cfDNAvsTissue  <- read_tsv("./data/compareAll_paper.tsv")
+}
+
+a <- cfDNAvsTissue %>% select(PatientID,  UniqueID, CFD_ID, cpa_cfDNA, pearsonR)
+colnames(a) <- c("PatientID", "UniqueID","SampleID", "CPAm", "pearsonR")
+a$biomaterial <- "cfDNA"
+
+b <- cfDNAvsTissue %>% select(PatientID, UniqueID, tumorDNA_ID, cpa_tumorDNA, pearsonR )
+colnames(b) <-  c("PatientID", "UniqueID","SampleID", "CPAm", "pearsonR")
+b$biomaterial <- "tumor DNA"
+
+a <- rbind(a,b)
+sample_annotation_long <- left_join(sample_annotation_long, a)
+a <- NULL
+b <- NULL
+
+cfDNAvsTissue <- merge(sample_annotation, cfDNAvsTissue, by = c("PatientID", "UniqueID", "PatientID", "CFD_ID", "tumorDNA_ID"))
+```
+
+```{r}
+library(geiger)
+binsize = "200kb"
+
+makeLog2comparison <- function(datadir1, datadir2, sample1, sample2, patientID){
+   
+   print(paste0("cfDNA sample: ", sample1))
+   print(paste0("tumorDNA sample: ", sample2))
+   print(paste0("binsize: ", binsize))
+   
+   
+   tmp_A <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "segments_per_200kb_mask.tsv")), col_types = c("fddd"),
+                     col_names = c("chr", "start", "end", "ratio_cfDNA"), skip = 1)
+   tmp_A <- tmp_A %>% filter(!chr %in% c("X", "Y", "23", "24")) 
+   
+   
+   segs_A <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "segments_mask.bed")), col_types = c("fdddd"),
+                      col_names = c("chr", "start", "end", "ratio", "zscore"))
+   segs_A <- segs_A %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   
+   tmp_B <- read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample2), "segments_per_200kb_mask.tsv")), col_types = c("fddd"),
+                     col_names = c("chr", "start", "end", "ratio_tumor"), skip = 1)
+   tmp_B <- tmp_B %>% filter(!chr %in% c("X", "Y", "23", "24")) 
+   
+   if (tumor_input == "array_BE" | tumor_input == "array_CZ" | tumor_input == "WES_FR"){
+      segs_B <- read_tsv(paste0(datadir2,"/",sample2,"_", binsize, "_segments.tsv"), col_types = c("fddd"),
+                         col_names = c("chr", "start", "end", "ratio"), skip = 1)
+      
+      segs_B <- segs_B %>% filter(!chr %in% c("X", "Y", "23", "24")) 
+   } else if (tumor_input == "sWGS"){
+      segs_B <- read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample2), "segments_mask.bed")), col_types = c("fdddd"),
+                         col_names = c("chr", "start", "end", "ratio", "zscore"))
+      segs_B <- segs_B %>% filter(!chr %in% c("X", "Y", "23", "24")) 
+   }
+   # 
+   # segs_B <- read_tsv(paste0(datadir2,"/",sample2,"_", binsize, "_segments.tsv"), col_types = c("fddd"),
+   #                      col_names = c("chr", "start", "end", "ratio"), skip = 1)
+   # 
+   # segs_B <- segs_B %>% filter(!chr %in% c("X", "Y", "23", "24")) 
+   
+   tmp <- inner_join(tmp_A, tmp_B)
+   tmp$abslog2diffPerBin <- abs(tmp$ratio_tumor - tmp$ratio_cfDNA)
+   segdiff <- nrow(segs_B) - nrow(segs_A)
+   
+   meanDiffPerBin <- mean(tmp$abslog2diffPerBin*segdiff)
+   cumulDiffPerBin <- sum(tmp$abslog2diffPerBin*segdiff)
+   data.frame(cfDNA_ID = sample1, tumorDNA_ID = sample2, mean_abs_diff_log2 = meanDiffPerBin, cumulDiffPerBin = cumulDiffPerBin)
+}
+
+makeBinsComparison <- function(datadir1, datadir2, sample1, sample2, patientID){
+   
+   bins_top <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "bins_mask")), col_types = c("fdd?d"),
+                        col_names = c("chr", "start", "end", "id", "ratio"), skip = 1)
+   bins_top <- bins_top %>% filter(!chr %in% c("X", "Y", "23", "24"))%>% mutate(SampleID = sample1)
+   
+   if (tumor_input == "array_BE" | tumor_input == "array_CZ" | tumor_input == "WES_FR" ){
+      bins_bottom <-  read_tsv(paste0(datadir2,"/",sample2,"_", binsize, ".tsv"), col_types = c("fddd"),
+                               col_names = c("chr", "start", "end", "ratio"))
+      bins_bottom <- bins_bottom %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(SampleID = sample2)
+      bins_bottom$chr <- factor(bins_bottom$chr, levels = chr_order)
+      
+   } else if (tumor_input == "sWGS"){
+      bins_bottom <-  read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample2), "bins_mask")), col_types = c("fdd?d"),
+                               col_names = c("chr", "start", "end", "id", "ratio"))
+      bins_bottom <- bins_bottom %>% filter(!chr %in% c("X", "Y", "23", "24"))%>% mutate(SampleID = sample2) %>% select(-id)
+      bins_bottom$chr <- factor(bins_bottom$chr, levels = chr_order)
+   }
+   
+   
+   corplot_df_bins <- full_join(bins_top, bins_bottom, by = c("chr", "start", "end")) %>% select(-chr, -start, -end)
+   colnames(corplot_df_bins) <- c("id", "L2R_cfDNA", "CFD_ID", "L2R_tumorDNA", "tumorDNA_ID")
+   corplot_df_bins$PatientID <- patientID
+   corplot_df_bins
+   
+}
+
+
+if (!file.exists("./data/alldiffs_paper.tsv")){
+   alldiffs <- data.frame()
+   L2Rcomparison <- data.frame()
+   for (row in 1:nrow(sample_annotation)){
+      sample1 <- sample_annotation[row,]$CFD_ID
+      sample2 <- sample_annotation[row,]$tumorDNA_ID
+      patientID <-  sample_annotation[row,]$PatientID
+      tissueplatform <- sample_annotation[row,]$tumorDNA_assay_detail
+      tumortype <- sample_annotation[row,]$TumorType
+      datadir1 <- datadir_sWGS_cfDNA
+      if (sample_annotation[row,]$tumorDNA_assay == "array_BE"){
+         tumor_input = "array_BE"
+         datadir2 <-  datadir_arrayBE
+      } else if (sample_annotation[row,]$tumorDNA_assay == "array_CZ"){
+         tumor_input = "array_CZ"
+         datadir2 <-  datadir_arrayCZ
+      } else if (sample_annotation[row,]$tumorDNA_assay == "WES_FR"){
+         tumor_input = "WES_FR"
+         datadir2 <-  datadir_WES
+      } else if (sample_annotation[row,]$tumorDNA_assay == "sWGS"){
+         tumor_input = "sWGS"
+         datadir2 <-  datadir_sWGS_tissue
+      }
+      if (length(dir(datadir2, pattern = sample2) > 0  | length(dir(datadir1, pattern = sample1) > 0))) {
+         tmp <- makeLog2comparison(datadir1, datadir2, sample1, sample2, patientID)
+         tmp_L2R <- makeBinsComparison(datadir1, datadir2, sample1, sample2, patientID)
+         alldiffs <- rbind(alldiffs, tmp)
+         L2Rcomparison <- rbind(L2Rcomparison, tmp_L2R)
+      }
+      print(paste0("Processed: ", row, "/", nrow(sample_annotation)))
+   }
+   write_tsv(alldiffs, "./data/alldiffs_paper.tsv")
+   write_tsv(L2Rcomparison, "./data/L2R_paper.tsv")
+} else {
+   alldiffs  <- read_tsv("./data/alldiffs_paper.tsv")
+   L2Rcomparison <- read_tsv("./data/L2R_paper.tsv")
+}
+
+cfDNAvsTissue <- left_join(cfDNAvsTissue, alldiffs, by = c("CFD_ID" = "cfDNA_ID", "tumorDNA_ID" = "tumorDNA_ID"))
+L2Rcomparison <- left_join(cfDNAvsTissue, L2Rcomparison, by = c("CFD_ID" = "CFD_ID", "tumorDNA_ID" = "tumorDNA_ID", "PatientID" = "PatientID"))
+
+```
+
+
+```{r}
+if (!file.exists("./data/merged_segments_paper.tsv")){
+   read_segments <- function(datadir){
+      files<-list.files(c(datadir),recursive=TRUE)
+      files<-files[grep("egments_per_[0-9]+kb_mask", files)]
+      tmp_heatmap <- data.frame()
+      for(i in 1:length(files)){
+         name_sample <- gsub("_segments_per_[0-9]+kb_mask.tsv", "", files[i])
+         print(name_sample)
+         tmp <-  read_tsv(paste0(datadir,files[i]), col_types = c("fddd"),
+                          col_names = c("chr", "start", "end", "ratio"), skip = 1)
+         
+         colnames(tmp)<- c("chr", "start", "end", "ratio")
+         tmp <- tmp %>% filter(!chr %in% c("X", "Y", "23", "24"))
+         tmp$SampleID <- name_sample
+         tmp$meanLog2 <- get.cpa.modified2(tmp)
+         if (nrow(tmp_heatmap) == 0){
+            tmp_heatmap <- tmp
+         } else {
+            tmp_heatmap <- rbind(tmp_heatmap, tmp)
+         }
+      }
+      return(tmp_heatmap)
+   }
+   df_heatmap_init <- data.frame()
+   df_heatmap_init <- rbind(df_heatmap_init, read_segments(datadir_sWGS_cfDNA))
+   df_heatmap_init <- rbind(df_heatmap_init, read_segments(datadir_WES))
+   df_heatmap_init <- rbind(df_heatmap_init, read_segments(datadir_sWGS_tissue))
+   df_heatmap_init <- rbind(df_heatmap_init, read_segments(datadir_arrayCZ))
+   df_heatmap_init <- rbind(df_heatmap_init, read_segments(datadir_arrayBE))
+   
+   df_heatmap_healthy <- data.frame()
+   df_heatmap_healthy <- rbind(df_heatmap_healthy, read_segments(datadir_healthy))
+   write_tsv(df_heatmap_init, "./data/merged_segments_paper.tsv")
+   write_tsv(df_heatmap_healthy, "./data/merged_segments_healthy.tsv")
+} else {
+   df_heatmap_init <- read_tsv("./data/merged_segments_paper.tsv")
+   df_heatmap_healthy <- read_tsv("./data/merged_segments_healthy.tsv")
+}
+
+df_heatmap_init$SampleID <- gsub("_.*", "", df_heatmap_init$SampleID)
+df_heatmap_init <- df_heatmap_init 
+
+a <- df_heatmap_init %>% distinct(meanLog2, SampleID)
+cfDNAvsTissue <- left_join(cfDNAvsTissue, a, by = c("CFD_ID" = "SampleID"))
+cfDNAvsTissue <- left_join(cfDNAvsTissue, a, by = c("tumorDNA_ID" = "SampleID"))
+cfDNAvsTissue$deltaLog2 <- abs(cfDNAvsTissue$meanLog2.x - cfDNAvsTissue$meanLog2.y)
+a <- NULL
+
+```
+
+# Calculation of the 1% FDR for CPAm/CPA values
+A normal distribution is fitted to the CPAm values, and based on the mean and SD, the qnorm(.99) is determined to obtain the 1% FDR ratio.
+
+```{r}
+conflict_prefer("melt", "data.table")
+normal_CPA <- read_csv("./data/sWGS_healthy/CPA_all.csv") %>% dplyr::select(-CPAm) %>% melt() 
+colnames(normal_CPA) <- c("CFD_ID","cpa_type", "cpa_cfDNA")
+
+normal_CPAm <- read_csv("./data/sWGS_healthy/CPA_all.csv") %>% dplyr::select(-CPA) %>% melt() 
+colnames(normal_CPAm) <- c("CFD_ID","cpa_type", "cpa_cfDNA")
+normal_CPAm$cpa_tumorDNA <- normal_CPA$cpa_cfDNA
+normal_CPAm$TumorType <- "healthy"
+normal_CPAm$CFD_biomaterial <- "plasma"
+normal_CPAm$SampleOrigin <- "UZG"
+normal_CPAm$cfDNA_HMW_ratio <- 0
+cfDNAvsTissue_withHealthy <- bind_rows(cfDNAvsTissue, normal_CPAm)
+
+
+calculate_CPA_FDR <- function(input, title ){
+   P = ecdf(input %>% pull(cpa_cfDNA)) 
+   plot(P, main = title)
+   
+   library(MASS)
+   x <- input %>% pull(cpa_cfDNA)
+   fit_normal <- fitdistr(x, densfun ="normal")
+   para <- fit_normal$estimate
+   
+   curve(dnorm(x, para[1], para[2]), col = 2, add = FALSE, xlim = c(0,1.5))
+   hist(input %>% pull(cpa_cfDNA), prob=TRUE, add = TRUE)
+   
+   
+   FDR_CPA <- qnorm(.99, mean = para[1], sd = para[2])
+   detach("package:MASS", unload = TRUE)
+   return(FDR_CPA)
+}
+```
+
+## 1% FDR CPAm
+```{r}
+FDR_CPAm <- calculate_CPA_FDR(normal_CPAm, title = "cumulative plot CPAm")
+```
+
+## 1% FDR CPA
+```{r}
+FDR_CPA <- calculate_CPA_FDR(normal_CPA, title = "cumulative plot CPA ")
+```
+
+```{r}
+#cfDNAvsTissue$CNA_tumor <- ifelse(cfDNAvsTissue$cpa_tumorDNA < FDR_CPAm, "flat", "CNA")
+cfDNAvsTissue$CNA_cfDNA <- ifelse(cfDNAvsTissue$cpa_cfDNA < FDR_CPAm, "flat", "CNA")
+#cfDNAvsTissue$CNA_all <- paste0(cfDNAvsTissue$CNA_tumor, "-", cfDNAvsTissue$CNA_cfDNA)
+```
+
+The 1% FDR for CPAm is `r FDR_CPAm` and the 1% FDR for CPA is `r FDR_CPA`. 
+
+# Difference plot between cfDNA and tumor DNA
+By visualising the mean of the log2(ratio), we can observe that for some CNAs (e.g. 17q gain in plasma), the abberations in plasma are higher than in tumor tissue.
+
+```{r}
+makeBarTumorvscfDNA <- function(tumor){
+   barPlot <- df_heatmap_init
+   sampleFilt_a <- sample_annotation_long %>% filter(cfDNA_HMW_ratio > 5) %>% filter(TumorType == tumor & biomaterial == "cfDNA") %>% pull(SampleID)
+   barPlot_a <- barPlot %>% filter(SampleID %in% sampleFilt_a)
+   barPlot_a <- barPlot_a %>% group_by(chr, start) %>%
+      summarise(mean = mean(ratio, na.rm = TRUE),
+                sd = sd(ratio, na.rm = TRUE),
+                n = n()) %>%
+      mutate(se = sd / sqrt(n),
+             lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+             upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se) 
+   barPlot_a$biomaterial <- "cfDNA"
+   
+   sampleFilt_b <- sample_annotation_long %>% filter(cfDNA_HMW_ratio > 1) %>% filter(TumorType == tumor & biomaterial == "tumor DNA") %>% pull(SampleID)
+   barPlot_b <- barPlot %>% filter(SampleID %in% sampleFilt_b)
+   barPlot_b <- barPlot_b %>% group_by(chr, start) %>%
+      summarise(mean = mean(ratio, na.rm = TRUE),
+                sd = sd(ratio, na.rm = TRUE),
+                n = n()) %>%
+      mutate(se = sd / sqrt(n),
+             lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+             upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se) 
+   barPlot_b$biomaterial <- "tumor DNA"
+   
+   
+   ggplot() + 
+      theme_bw() + 
+      # labs(title = paste0(patientID, " - ", tissueplatform, " tissue - ", sample2, " - ",cpa.calc, ": ", cpa_bottom, " - ", tumortype), y = "log2(ratio)") +
+      geom_bar(data = barPlot_a, aes(x = start, y = mean, col = biomaterial, fill = biomaterial), stat = "identity", position = "dodge", alpha = 1, size = 0) +
+      geom_bar(data = barPlot_b, aes(x = start, y = mean, col = biomaterial, fill = biomaterial), stat = "identity", position = "dodge", alpha = 0.5, size = 0) +
+      lims(y = c(-.6,.6))+ 
+      labs(title = paste0(tumor, " (n = ", length(sampleFilt_b),")"), y = "mean of log2(ratio) across all samples")+
+      theme(panel.spacing.x = unit(0, "lines"),
+            panel.spacing.y = unit(0, "lines"),
+            axis.title.x =  element_blank(),
+            axis.text.x =  element_blank(),
+            axis.ticks.x =  element_blank(),
+            strip.background = element_rect(color = "white", fill = "white"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank()) + 
+      geom_hline(yintercept = 0, linetype = "dashed", col = "gray") +
+      facet_wrap(~chr, strip.position = "bottom", scales ="free_x", nrow = 1)}
+
+p1 <- makeBarTumorvscfDNA("neuroblastoma")
+p2 <- makeBarTumorvscfDNA("nephroblastoma")
+p3 <- makeBarTumorvscfDNA("osteosarcoma")
+p4 <- makeBarTumorvscfDNA("rhabdomyosarcoma")
+p5 <- makeBarTumorvscfDNA("Ewing sarcoma")
+```
+
+
+```{r, fig.width= 8, fig.height= 16}
+#ggarrange(p1, p2, p4, p5, ncol = 1, common.legend = TRUE)
+
+#ggsave(paste0(plotfolder, "comparativeplot.png"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 12)
+#ggsave(paste0(plotfolder, "comparativeplot.svg"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 12)
+#ggsave(paste0(plotfolder, "comparativeplot.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 12)
+```
+
+# Sequencing quality control metrics
+## Mapped reads
+```{r}
+mapped_reads <- read_tsv("./data/logs/multiqc_data/multiqc_samtools_stats.txt")
+mapped_reads$Sample <- gsub("_.*", "", mapped_reads$Sample)
+mapped_reads <- inner_join(mapped_reads, sample_annotation_long, by = c("Sample" = "SampleID"))
+
+
+ggplot(mapped_reads, aes(y = biomaterial, x =  reads_mapped_percent, fill = biomaterial )) + 
+   geom_density_ridges2(scale = 0.5, alpha = 0.5, 
+                        jittered_points = TRUE, position = "raincloud",
+                        aes(point_color = biomaterial, point_fill = biomaterial)) +
+   geom_boxplot(alpha = 0.5, width = 0.1) + theme_bw() + 
+   lims(x = c(0,100)) +
+   labs(title = "Alignment percentage across all samples", x = "reads mapped with bwa mem (%)")
+
+mapped_reads %>% filter(reads_mapped_percent < 24) %>% select(Sample, reads_mapped_percent)
+
+ggsave(paste0(plotfolder, "mapped_reads.png"), plot = ggplot2::last_plot(), dpi = 300, width = 6, height = 4)
+ggsave(paste0(plotfolder, "mapped_reads.svg"), plot = ggplot2::last_plot(), dpi = 300, width = 6, height = 4)
+ggsave(paste0(plotfolder, "mapped_reads.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 6, height = 4)
+```
+
+
+## Duplicate percentage
+```{r}
+duplicated_reads <- read_tsv("./data/logs/multiqc_data/multiqc_picard_dups.txt")
+duplicated_reads$Sample <- gsub("_.*", "", duplicated_reads$Sample)
+duplicated_reads <- inner_join(duplicated_reads, sample_annotation_long, by = c("Sample" = "SampleID"))
+duplicated_reads$duplicate_percentage <- duplicated_reads$UNPAIRED_READ_DUPLICATES/duplicated_reads$UNPAIRED_READS_EXAMINED*100
+
+ggplot(duplicated_reads, aes(y = biomaterial, x =  UNPAIRED_READ_DUPLICATES/UNPAIRED_READS_EXAMINED*100, fill = biomaterial )) + 
+   geom_density_ridges2(scale = 0.5, alpha = 0.5, 
+                        jittered_points = TRUE, position = "raincloud",
+                        aes(point_color = biomaterial, point_fill = biomaterial)) +
+   geom_boxplot(alpha = 0.5, width = 0.1) + theme_bw() + 
+   lims(x = c(0,100)) +
+   labs(title = "duplicate percentage across all samples", x = "duplicate reads with Picard (%)") 
+
+ggsave(paste0(plotfolder, "duplicate_perc.png"), plot = ggplot2::last_plot(), dpi = 300, width = 6, height = 4)
+ggsave(paste0(plotfolder, "duplicate_perc.svg"), plot = ggplot2::last_plot(), dpi = 300, width = 6, height = 4)
+ggsave(paste0(plotfolder, "duplicate_perc.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 6, height = 4)
+
+ggplot(mapped_reads, aes(y = biomaterial, x =  reads_mapped, fill = biomaterial )) + 
+   geom_density_ridges2(scale = 0.5, alpha = 0.5, 
+                        jittered_points = TRUE, position = "raincloud",
+                        aes(point_color = biomaterial, point_fill = biomaterial)) +
+   geom_boxplot(alpha = 0.5, width = 0.1) + theme_bw() + 
+   #lims(x = c(0,100)) +
+   labs(title = "absolute number of mapped reads after deduplication", x = "number of remaining reads") 
+```
+
+## Tumor types in dataset
+```{r}
+cfDNAvsTissue$TumorType <- gsub("malignant rhabdoid tumor of the kidney", "MRTK", cfDNAvsTissue$TumorType)
+p1 <- ggplot(cfDNAvsTissue %>% distinct(PatientID, .keep_all = TRUE), aes(fill = SampleOrigin, x = reorder(TumorType, TumorType, function(x) -length(x)))) + theme_bw() +
+   geom_bar(alpha = 0.9) + labs(x = "", title = "all tumor types", y = "number of unique cases", fill = NULL)+ 
+   theme(axis.text.x = element_text(angle = 45,hjust=1))  +
+   scale_fill_manual(values = qg_palette("USopen")[c(4,1:3)])
+
+p2 <- ggplot(cfDNAvsTissue, aes(fill = SampleOrigin, x = reorder(tumorDNA_assay_detail, tumorDNA_assay_detail, function(x) -length(x)))) + theme_bw() +
+   geom_bar(alpha = 0.9) + labs(x = "", title = "tissue DNA platform", y = "number of samples", fill = NULL)+ 
+   theme(axis.text.x = element_text(angle = 45,hjust=1))  +
+   scale_fill_manual(values = qg_palette("USopen")[c(4,1:3)])
+
+ggarrange(p1, p2, labels = c("A", "B"), align = c("h"), widths = c(0.6, 0.4), common.legend = TRUE, legend = "top")
+
+ggsave(paste0(plotfolder, "tumorsInDataset.png"), plot = ggplot2::last_plot(), dpi = 300, width = 10, height = 6)
+ggsave(paste0(plotfolder, "tumorsInDataset.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 10, height = 6)
+
+cfDNAvsTissue_select <- cfDNAvsTissue_withHealthy %>% filter(TumorType %in% c("neuroblastoma", "nephroblastoma", "osteosarcoma", "rhabdomyosarcoma", "Ewing sarcoma", "healthy") & (cpa_type == "CPAm")) %>% filter(as.numeric(cfDNA_HMW_ratio) >= 0)
+
+ylabs_a <- cfDNAvsTissue_select %>% filter(TumorType != "healthy") %>% pull(TumorAbbrev) %>% as.factor()
+ylabs <- paste(levels(ylabs_a)," (n=",table(ylabs_a),")",sep="")
+
+ridgeplot_cfDNA_per_tumor <- ggplot(
+   cfDNAvsTissue_select %>% filter(TumorType != "healthy"), 
+   aes(y = TumorType, x = cpa_cfDNA, fill = TumorType)) +
+   geom_density_ridges(show.legend = FALSE, scale = 0.8, panel_scaling = FALSE,
+                       point_alpha = 0.7, alpha = .2, point_shape = 1,
+                       aes(point_color = TumorType,
+                           point_fill = TumorType,
+                           point_size = as.numeric(cfDNA_HMW_ratio)), 
+                       jittered_points = TRUE, position = "raincloud") +
+   theme_bw() + lims(x = c(0,8)) + 
+   labs(point_size = "cfDNA/HMW ratio", fill = "tumor", point_fill = "tumor", point_color = "tumor", x = "CPAm cfDNA", y = "tumor") + 
+   geom_boxplot(alpha = 0.4, width = 0.2, show.legend = FALSE, outlier.shape = NA) + 
+   theme(legend.position="right")+
+   geom_vline(data=cfDNAvsTissue %>% filter(cpa_type == "CPAm"), alpha = 0.6, aes(xintercept = FDR_CPAm), linetype = "dashed")+
+   annotate("rect",xmin = 0, xmax = FDR_CPAm, ymin = -Inf, ymax = Inf, alpha=0.3, fill="grey")  + lims(x = c(0,NA)) +
+   scale_y_discrete(labels=ylabs)
+
+ridgeplot_tissueDNA_per_tumor <- ggplot(
+   cfDNAvsTissue_select %>% filter(TumorType != "healthy"), 
+   aes(y = TumorType, x = cpa_tumorDNA, fill = TumorType)) +
+   geom_density_ridges(show.legend = FALSE, scale = 0.8, panel_scaling = FALSE,
+                       point_alpha = 0.7, alpha = .2, point_shape = 1,
+                       aes(point_color = TumorType, point_fill = TumorType), jittered_points = TRUE, position = "raincloud") +
+   theme_bw()  + lims(x = c(0,8)) + 
+   labs(y="", point_size = "cfDNA/HMW ratio", fill = "tumor", point_fill = "tumor", point_color = "tumor", x = "CPAm tumorDNA", y = "tumor") + 
+   geom_boxplot(alpha = 0.4, width = 0.2, show.legend = FALSE, outlier.shape = NA) + 
+   theme(legend.position="right") + theme(axis.text.y = element_blank())
+```
+
+# Time between tissue and liquid sampling
+```{r}
+ggplot(sample_annotation, aes(fill = TumorGroup, col = TumorGroup, y = delta_tissue_liquid, x = reorder(UniqueID, -delta_tissue_liquid))) + 
+            geom_bar(stat = "identity") + 
+            theme(axis.ticks.x=element_blank())  + theme_bw() + labs(title = "time between sampling of the different biomaterials", x = "bars represent individual cases", y = "days between tissue sampling and liquid sampling") +
+            theme(axis.text.x=element_blank(),axis.ticks.x=element_blank())+ lims(y = c(-31,31))# +
+    # geom_text(col = 'black', aes(label=delta_tissue_liquid), position=position_dodge(width=0.9), vjust=-0.25)
+
+
+ggplot(sample_annotation_long, aes(y = pearsonR, x = delta_tissue_liquid, col = TumorGroup)) + geom_point() + lims(x = c(-50,50)) + theme_bw()
+```
+
+## Effect of treatment on nephroblastoma samples
+
+```{r}
+makeNFBdelta<- function(datadir1, datadir2, sample1, sample2, patientID, uniqueID, binsize, tumor_input, tumortype, tissueplatform, delta, ratio){
+   
+   print(paste0("cfDNA sample: ", sample1))
+   print(paste0("tumorDNA sample: ", sample2))
+   print(paste0("binsize: ", binsize))
+   
+   
+   bins_top <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "bins_mask")), col_types = c("fdd?d"),
+                        col_names = c("chr", "start", "end", "id", "ratio"), skip = 1)
+   bins_top <- bins_top %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   
+   segs_top <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "segments_mask.bed")), col_types = c("fdddd"),
+                        col_names = c("chr", "start", "end", "ratio", "zscore"))
+   segs_top <- segs_top %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample1)
+   
+   if (tumor_input == "array_BE" | tumor_input == "array_CZ" | tumor_input == "WES_FR" ){
+      bins_bottom <-  read_tsv(paste0(datadir2,"/",sample2,"_", binsize, ".tsv"), col_types = c("fddd"),
+                               col_names = c("chr", "start", "end", "ratio"))
+      bins_bottom <- bins_bottom %>% filter(!chr %in% c("X", "Y", "23", "24"))
+      bins_bottom$chr <- factor(bins_bottom$chr, levels = chr_order)
+      
+      segs_bottom <- read_tsv(paste0(datadir2,"/",sample2,"_", binsize, "_segments.tsv"), col_types = c("fddd"),
+                              col_names = c("chr", "start", "end", "ratio"), skip = 1)
+      
+      segs_bottom <- segs_bottom %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample2)
+      segs_bottom$chr <- factor(segs_bottom$chr, levels = chr_order)
+   } else if (tumor_input == "sWGS"){
+      bins_bottom <-  read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample2), "bins_mask")), col_types = c("fdd?d"),
+                               col_names = c("chr", "start", "end", "id", "ratio"))
+      bins_bottom <- bins_bottom %>% filter(!chr %in% c("X", "Y", "23", "24"))
+      bins_bottom$chr <- factor(bins_bottom$chr, levels = chr_order)
+      
+      segs_bottom <- read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample2), "segments_mask.bed")), col_types = c("fdddd"),
+                              col_names = c("chr", "start", "end", "ratio", "zscore"))
+      segs_bottom <- segs_bottom %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample2)
+      segs_bottom$chr <- factor(segs_bottom$chr, levels = chr_order)
+   }
+   
+   color_top <- wes_palette("Cavalcanti1")[1]
+   color_bottom <- "#5E81AC" #wes_palette("Cavalcanti1")[4]
+   color_abberations <- wes_palette("Cavalcanti1")[5]
+   
+   max.ratio_bins <- max(c(bins_top$ratio, bins_bottom$ratio), na.rm = TRUE)
+   min.ratio_bins <- min(c(bins_top$ratio, bins_bottom$ratio), na.rm = TRUE)
+   
+   max.ratio_bins.top <- max(c(bins_top$ratio), na.rm = TRUE)
+   min.ratio_bins.top <- min(c(bins_top$ratio), na.rm = TRUE)
+   
+   max.ratio_bins.bottom <- max(c(bins_bottom$ratio), na.rm = TRUE)
+   min.ratio_bins.bottom <- min(c(bins_bottom$ratio), na.rm = TRUE)
+   
+   
+   if (tumor_input == "sWGS"){
+      cpa_top <- round(get.cpa(segs_top),4)
+      cpa_bottom <- round(get.cpa(segs_bottom),4)
+      cpa_top <- round(get.cpa.modified2(segs_top),4)
+      cpa_bottom <- round(get.cpa.modified2(segs_bottom),4)
+      cpa.calc <- "CPAm"
+   } else{
+      cpa_top <- round(get.cpa.modified2(segs_top),4)
+      cpa_bottom <- round(get.cpa.modified2(segs_bottom),4)
+      cpa.calc <- "CPAm"
+   }
+   
+   
+   corplot_df_bins <- inner_join(bins_top, bins_bottom, by = c("chr", "start", "end"))
+   #corplot_df <- corplot_df %>% filter(!is.na(ratio.x) & !is.na(ratio.y))
+   
+   corplot_df_bins <- corplot_df_bins %>%
+      mutate(rM.top=rollapply(ratio.x,50, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) %>%
+      mutate(rM.bottom=rollapply(ratio.y,50, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) 
+   
+   corplot_df_bins$delta <- corplot_df_bins$rM.top - corplot_df_bins$rM.bottom 
+   rollmean <- ggplot(tibble(corplot_df_bins), aes(x = start)) + 
+      theme_bw() + 
+      geom_line(aes(y=rM.bottom), col = color_bottom, alpha = 1, size = 1) +
+      labs(title = paste0("difference plot for ", patientID, " - ", tissueplatform, " tissue - ", sample2, " - ", tumortype, " - delay: ", as.character(delta), " days - ratio: ", ratio), y = "log2(ratio)", x = "chromosomes") +  
+      geom_line(aes(y=rM.top), col = color_top, alpha = 0.7, size = 1) +
+       #geom_line(aes(y=), col = color_bottom, alpha = 0.7, size = 1) +
+      theme(panel.spacing.x = unit(0, "lines"),
+            panel.spacing.y = unit(0, "lines"),
+            #  axis.title.x =  element_blank(),
+            axis.text.x =  element_blank(),
+            axis.ticks.x =  element_blank(),
+            strip.background = element_rect(color = "white", fill = "white"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank()) + 
+      geom_hline(yintercept = 0, linetype = "dashed", col = "gray") +
+      facet_wrap(~chr, strip.position = "bottom", scales ="free_x", nrow = 1) + lims(y = c(-2,2))#+
+    # geom_area(aes(y = rM.bottom), fill =color_bottom,
+    #          alpha = 0.5, position = 'identity')   +
+   #  geom_area(aes(y = rM.top), fill =color_top,
+   #           alpha = 0.5, position = 'identity')
+   
+   ggsave(paste0(plotfolder, patientID, "_", sample1, "_", sample2, "_", binsize, "differenceplot.png"), plot = rollmean, width = 10, height = 3, dpi = 300)
+}
+
+
+if (!file.exists("./data/compareAll_NFB.tsv")){
+   NFB_delta <- data.frame()
+   NFB_samples <- sample_annotation %>%filter(TumorGroup == "kidney tumor")
+   for (row in 1:nrow(NFB_samples)){
+      sample1 <- NFB_samples[row,]$CFD_ID
+      sample2 <- NFB_samples[row,]$tumorDNA_ID
+      patientID <-  NFB_samples[row,]$PatientID
+      uniqueID <-  NFB_samples[row,]$UniqueID
+      tissueplatform <- NFB_samples[row,]$tumorDNA_assay_detail
+      tumortype <- NFB_samples[row,]$TumorType
+      datadir1 <- datadir_sWGS_cfDNA
+      delta_tissue_liquid <- as.character(NFB_samples[row,]$delta_tissue_liquid)
+      ratio <- as.character(round(NFB_samples[row,]$cfDNA_HMW_ratio,4))
+      if (NFB_samples[row,]$tumorDNA_assay == "array_BE"){
+         input_tumor = "array_BE"
+         datadir2 <-  datadir_arrayBE
+      } else if (NFB_samples[row,]$tumorDNA_assay == "array_CZ"){
+         input_tumor = "array_CZ"
+         datadir2 <-  datadir_arrayCZ
+      } else if (NFB_samples[row,]$tumorDNA_assay == "WES_FR"){
+         input_tumor = "WES_FR"
+         datadir2 <-  datadir_WES
+      } else if (NFB_samples[row,]$tumorDNA_assay == "sWGS"){
+         input_tumor = "sWGS"
+         datadir2 <-  datadir_sWGS_tissue
+      }
+      if (length(dir(datadir2, pattern = sample2) > 0  | length(dir(datadir1, pattern = sample1) > 0))) {
+         tmp <- makeNFBdelta(datadir1, datadir2, sample1, sample2, patientID, uniqueID, "200kb", input_tumor, tumortype,tissueplatform, delta_tissue_liquid, ratio)
+         NFB_delta <- rbind(NFB_delta, tmp)
+      }
+      print(paste0("Processed: ", row, "/", nrow(NFB_samples)))
+   }
+   write_tsv(cfDNAvsTissue, "./data/compareAll_NFB.tsv")
+} 
+
+
+```
+
+# CNAs in tumor tissue
+
+As we were not able to determine a 1% FDR cutoff for tumor tissue (see manuscript), the scoring was done manually (i.e. containing CNAs or not containing any CNAs) by two independent scorers, and a consensus was reached for all samples. 
+
+In these figures, we can seee that the CPAm is in general low for the samples that were scored as to not have any CNAs, which is to be expected. Most tumor samples have CNAs as well. 
+
+- The number of tumor samples with CNAs:  `r cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "TRUE") %>% pull(tumorDNA_CNAs_consensus) %>% length() `
+- The number of tumor samples with no CNAs:  `r cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "FALSE") %>% pull(tumorDNA_CNAs_consensus) %>% length() `
+- The number of cfDNA samples with CNAs:  `r cfDNAvsTissue %>% filter(CNA_cfDNA == "CNA") %>% pull(CNA_cfDNA) %>% length() `
+- The number of cfDNA samples being flat:  `r cfDNAvsTissue %>% filter(CNA_cfDNA == "flat") %>% pull(CNA_cfDNA) %>% length() `
+- The median CPAm in tumors: `r median(cfDNAvsTissue$cpa_tumorDNA)` and Q1/Q3 `r quantile(cfDNAvsTissue$cpa_tumorDNA)`
+- The median CPAm in cfDNA: `r median(cfDNAvsTissue$cpa_cfDNA)` and Q1/Q3 `r quantile(cfDNAvsTissue$cpa_cfDNA)`
+
+# Comparison of cfDNA vs tissue
+
+```{r}
+ggplot(cfDNAvsTissue, aes(x = TumorAbbrev, y = cpa_tumorDNA, col = tumorDNA_CNAs_consensus, label = PatientID))+ theme_bw()  +
+   theme(axis.text.x = element_text(angle = 45,hjust=1))  + geom_boxplot(alpha = 0.4, aes(col = NULL)) + geom_beeswarm(alpha = 0.7)  + facet_wrap(~TumorGroup, scales = "free_x") + labs(y = "CPAm tumorDNA")
+
+ggsave(paste0(plotfolder, "CPA_tumor.png"), plot = ggplot2::last_plot(), dpi = 300, width = 10, height = 6)
+ggsave(paste0(plotfolder, "CPA_tumor.svg"), plot = ggplot2::last_plot(), dpi = 300, width = 10, height = 6)
+ggsave(paste0(plotfolder, "CPA_tumor.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 10, height = 6)
+```
+
+## Crosstable of cfDNA and tumor CNAs {.tabset}
+
+Looking further into the data, we can see that many samples that contain CNAs in the tumor do not contain CNAs in the cfDNA (n = 50). Here, we can see an association with cfDNA/HMW ratio.
+
+### All samples
+```{r, fig.height=16, fig.width= 6}
+cfDNAvsTissue$CNA_cfDNA_bool <- ifelse(cfDNAvsTissue$CNA_cfDNA == "CNA", TRUE, FALSE)
+cfDNAvsTissue$CNA_tumorDNA <- ifelse(cfDNAvsTissue$tumorDNA_CNAs_consensus == TRUE, "CNA", "flat")
+cfDNAvsTissue$tumorDNA_CNAs_consensus <- as.logical(cfDNAvsTissue$tumorDNA_CNAs_consensus)
+sjt.xtab(cfDNAvsTissue$tumorDNA_CNAs_consensus , cfDNAvsTissue$CNA_cfDNA_bool, var.labels=c("tumor", "cfDNA"), value.labels = list(c("neutral", "CNA"), c("neutral", "CNA")), title = "crosstable for all samples")
+
+input_df <- cfDNAvsTissue %>% select(quality_score, UniqueID, CNA_cfDNA, CNA_tumorDNA)
+input_df <- cfDNAvsTissue %>% select(quality_score, UniqueID, MYCN_amplification_cfDNA, MYCN_amplification_tumor)
+makeUpsetR <- function(input_df, add_title){
+  var_single <- input_df  %>% distinct(UniqueID, .keep_all = TRUE)
+  var_single$quality_score[is.na(var_single$quality_score )] <- "not measured"
+  colnames(var_single) <- c("quality_score", "UniqueID", "CNAs in cfDNA", "CNAs in tumorDNA")
+  var_single <- var_single %>%
+      gather(Feature, value, `CNAs in cfDNA`:`CNAs in tumorDNA`) %>%
+      group_by(UniqueID, quality_score) %>%
+      summarize(Features = paste0(Feature[value != 0], collapse="-"))
+  
+  ggplot(transform(var_single %>% distinct(UniqueID, .keep_all = TRUE), quality_score=factor(quality_score, levels=c("low", "medium", "high", "not measured"), labels = c("cfDNA/HMW ratio [0,1)", "cfDNA/HMW ratio [1,5)", "cfDNA/HMW ratio [5,∞)", "ratio not measured"))), aes(x = Features)) +
+   geom_bar() + theme_bw() + 
+  # scale_x_upset(order_by = "degree") +
+   geom_text(stat='count', aes(label=after_stat(count)), vjust=-1) +
+   axis_combmatrix(sep = "-") + labs(x = "")+ facet_wrap(~quality_score, nrow = 1) + lims(y = c(0,55))
+}
+
+upset_a <- makeUpsetR(cfDNAvsTissue  %>% select(quality_score, UniqueID, CNA_cfDNA_bool, tumorDNA_CNAs_consensus), add_title = " depicting discordance and concordance between biomaterials")
+
+
+ggsave("./plots/upset.png", upset_a, dpi = 300, width = 10, height = 6.3)
+ggsave("./plots/upset.pdf", upset_a, dpi = 300, width = 10, height = 6.3)
+ggsave("./plots/upset.svg", upset_a, dpi = 300, width = 10, height = 6.3)
+
+input_df <- cfDNAvsTissue %>% select(quality_score, UniqueID, MYCN_amplification_cfDNA, MYCN_amplification_tumor) %>% filter(!is.na(MYCN_amplification_cfDNA))
+var_single <- input_df  %>% distinct(UniqueID, .keep_all = TRUE)
+var_single$quality_score[is.na(var_single$quality_score )] <- "not measured"
+colnames(var_single) <- c("quality_score", "UniqueID", "MYCNa cfDNA", "MYCNa tumor DNA")
+var_single <- var_single %>%
+   gather(Feature, value, `MYCNa cfDNA`:`MYCNa tumor DNA`) %>%
+   group_by(UniqueID, quality_score) %>%
+   summarize(Features = paste0(Feature[value != 0], collapse="-"))
+
+upset_b <- ggplot(transform(var_single %>% distinct(UniqueID, .keep_all = TRUE), quality_score=factor(quality_score, levels=c("low", "medium", "high", "not measured"), labels = c("cfDNA/HMW ratio [0,1)", "cfDNA/HMW ratio [1,5)", "cfDNA/HMW ratio [5,∞)", "ratio not measured"))), aes(x = Features)) +
+geom_bar() + theme_bw() + 
+# scale_x_upset(order_by = "degree") +
+geom_text(stat='count', aes(label=after_stat(count)), vjust=-1) +
+axis_combmatrix(sep = "-")  + labs(x = "")+ facet_wrap(~quality_score, nrow = 1) + lims(y = c(0,30))
+  
+input_df <- cfDNAvsTissue %>% select(quality_score, UniqueID, gain_1q_WT_cfDNA, gain_1q_WT_tumor) %>% filter(!is.na(gain_1q_WT_cfDNA))
+var_single <- input_df  %>% distinct(UniqueID, .keep_all = TRUE)
+var_single$quality_score[is.na(var_single$quality_score )] <- "not measured"
+colnames(var_single) <- c("quality_score", "UniqueID", "1q gain cfDNA", "1q gain tumor DNA")
+var_single <- var_single %>%
+   gather(Feature, value, `1q gain cfDNA`:`1q gain tumor DNA`) %>%
+   group_by(UniqueID, quality_score) %>%
+   summarize(Features = paste0(Feature[value != 0], collapse="-"))
+
+upset_c <- ggplot(transform(var_single %>% distinct(UniqueID, .keep_all = TRUE), quality_score=factor(quality_score, levels=c("low", "medium", "high", "not measured"), labels = c("cfDNA/HMW ratio [0,1)", "cfDNA/HMW ratio [1,5)", "cfDNA/HMW ratio [5,∞)", "ratio not measured"))), aes(x = Features)) +
+geom_bar() + theme_bw() + 
+# scale_x_upset(order_by = "degree") +
+geom_text(stat='count', aes(label=after_stat(count)), vjust=-1) +
+axis_combmatrix(sep = "-") + labs(x = "")+ facet_wrap(~quality_score, nrow = 1) + lims(y = c(0,6))
+
+upset_all <- ggarrange(upset_a, upset_b, upset_c, labels = c("A", "B", "C"), nrow = 3)
+
+ggsave("./plots/upset_all.png", upset_all, dpi = 300, width = 8, height = 14)
+ggsave("./plots/upset_all.pdf", upset_all, dpi = 300, width = 8, height = 14)
+ggsave("./plots/upset_all.svg", upset_all, dpi = 300, width = 8, height = 14)
+
+```
+
+
+### cfDNA/HMW ratio < 1
+```{r, fig.height= 6, fig.width= 6}
+sjt.xtab(cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% pull(tumorDNA_CNAs_consensus) , cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% pull(CNA_cfDNA_bool), var.labels=c("tumor", "cfDNA"), value.labels = list(c("neutral", "CNA"), c("neutral", "CNA")), title = "crosstable for samples with a cfDNA/HMW ratio < 1")
+
+#makeUpsetR(cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% select(UniqueID, CNA_cfDNA_bool, tumorDNA_CNAs_consensus), add_title = " for samples with a cfDNA/HMW ratio < 1")
+```
+
+### cfDNA/HMW ratio 1-5
+```{r, fig.height= 6, fig.width= 6}
+#sjt.xtab(cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 1 & cfDNA_HMW_ratio < 5) %>% pull(tumorDNA_CNAs_consensus) , cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 1 & cfDNA_HMW_ratio < 5) %>% pull(CNA_cfDNA_bool), var.labels=c("tumor", "cfDNA"), value.labels = list(c("neutral", "CNA"), c("neutral", "CNA")), title = "crosstable for samples with a cfDNA/HMW ratio [1,5]")
+
+#makeUpsetR(cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 1 & cfDNA_HMW_ratio < 5)%>% select(UniqueID, CNA_cfDNA_bool, tumorDNA_CNAs_consensus), add_title = " for samples with a cfDNA/HMW ratio [1,5]")
+```
+
+### cfDNA/HMW ratio > 5
+```{r, fig.height= 6, fig.width= 6}
+sjt.xtab(cfDNAvsTissue %>% filter(cfDNA_HMW_ratio > 5) %>% pull(tumorDNA_CNAs_consensus) , cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 5 ) %>% pull(CNA_cfDNA_bool), var.labels=c("tumor", "cfDNA"), value.labels = list(c("neutral", "CNA"), c("neutral", "CNA")), title = "crosstable for samples with a cfDNA/HMW ratio > 5 ")
+
+#makeUpsetR(cfDNAvsTissue %>% filter(cfDNA_HMW_ratio > 5) %>% select(UniqueID, CNA_cfDNA_bool, tumorDNA_CNAs_consensus), add_title = " for samples with a cfDNA/HMW ratio > 5 ")
+```
+
+
+## Correlation of CPAm and CPA
+
+Where possible (shallow WGS samples, n = 82), the correlation between the CPA and CPAm was calculated and yielded a Pearson R of 0.74 and a spearman rho of 0.86. The CPAm threshold of copy number neutral (“normal” or “flat”) at the 1% false discovery level in cfDNA was calculated on the cohort of healthy controls (individuals above 18 years old with no cancer diagnosis in their past medical history) from Raman et al. and was found to be 0.354. With this threshold, there are 4/82 cfDNA samples that were labeled discordant, i.e., copy number neutral with CPA and copy number aberrations with CPAm. Upon manual inspection, 3 out of these 4 samples contain visible CNAs, while 1 out of 4 samples is copy number neutral.
+
+```{r}
+CPA_df <- read_csv("./data/sWGS_tissue/CPA_all.csv")
+
+spearman_cor <- cor(CPA_df$CPA, CPA_df$CPAm, method = "spearman")
+
+ggplot(CPA_df, aes(x = CPA, y = CPAm)) + geom_point() + geom_smooth(method = 'lm') + theme_bw() + labs(title = paste0("Correlation between modified CPA (CPAm) and original CPA"), subtitle = paste0("Spearman rho = ", round(spearman_cor, 4))) + annotate("rect",ymin = 0, ymax = FDR_CPAm, xmin = -Inf, xmax = Inf, alpha=0.3, fill="grey") + scale_shape_manual(values=c(1,1,1,1,1)) + annotate("rect",xmin = 0, xmax = FDR_CPA, ymin = -Inf, ymax = Inf, alpha=0.3, fill="grey") + scale_shape_manual(values=c(1,1,1,1,1))
+```
+
+The samples that were discordant between CPA (1% FDR = `r FDR_CPA`) and CPAm (1% FDR = `r FDR_CPAm`) are:
+
+```{r}
+CPA_df %>% filter(CPA > FDR_CPA & CPAm < FDR_CPAm | CPA < FDR_CPA & CPAm > FDR_CPAm )
+```
+
+## Distribution of CPA in tissue DNA and cfDNA
+```{r}
+conflict_prefer("melt", "data.table")
+CPAm_ridge <- ggplot(
+   cfDNAvsTissue %>% select(cpa_tumorDNA, cpa_cfDNA, cpa_type)
+   %>% filter(cpa_type == "CPAm") %>% melt(), 
+   aes(y = variable, x = value, fill = variable)) +
+   geom_density_ridges2(scale = 0.8, panel_scaling = FALSE,
+                        point_alpha = 0.5, alpha = .2, 
+                        aes(point_color = variable, point_fill = variable),
+                        jittered_points = TRUE, position = "raincloud") +
+   theme_bw() + 
+   labs(fill = "tumor", point_fill = "tumor", point_color = "tumor", x = "CPAm", y = "tumor", title = "modified CPA")  + 
+   geom_boxplot(alpha = 0.4, width = 0.1)
+
+CPAm_ridge
+
+ggsave(paste0(plotfolder, "CPAm_ridgeplot.png"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 6)
+ggsave(paste0(plotfolder, "CPAm_ridgeplot.svg"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 6)
+ggsave(paste0(plotfolder, "CPAm_ridgeplot.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 6)
+```
+
+## cfDNA/HMW ratio distribution
+```{r}
+ggplot(cfDNAvsTissue, aes(x = as.numeric(cfDNA_HMW_ratio))) + 
+   geom_density(alpha = 0.5, fill = "gray", col = "black") + theme_bw() + scale_x_log10()+labs(x = "cfDNA/HMW ratio") 
+
+
+ggplot(cfDNAvsTissue, aes(col = TumorGroup, y = as.numeric(cpa_cfDNA), x = as.numeric(cfDNA_HMW_ratio))) + 
+   geom_point(alpha = 0.8) + theme_bw() + 
+   facet_wrap(~cpa_type, scales = "free_y") + labs(col = "cfDNA/HMW ratio")  + 
+   scale_x_log10() + 
+   labs(col = "tumor type", y = "CPAm cfDNA", x = "cfDNA/HMW ratio") 
+
+ggsave(paste0(plotfolder, "CPAm_cfDNAvsSampleQ.png"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 6)
+ggsave(paste0(plotfolder, "CPAm_cfDNAvsSampleQ.svg"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 6)
+ggsave(paste0(plotfolder, "CPAm_cfDNAvsSampleQ.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 6)
+```
+
+## CPA cfDNA vs Pearson R ~ cfDNA/HMW ratio
+```{r}
+BeforeAfter <- cfDNAvsTissue
+
+BeforeAfter$cfDNA_HMW_ratio <- as.character(BeforeAfter$cfDNA_HMW_ratio )
+BeforeAfter$colLabel <- ifelse(cfDNAvsTissue$cpa_tumorDNA > FDR_CPAm & cfDNAvsTissue$cpa_cfDNA < FDR_CPAm, "label",  "")
+BeforeAfter_melt <- BeforeAfter %>% select(TumorType, colLabel, PatientID, cpa_tumorDNA, cpa_cfDNA, cpa_type, TumorGroup, tumorDNA_assay_detail, cfDNA_HMW_ratio) %>% filter(cpa_type == "CPAm") %>% melt()
+BeforeAfter_melt$cfDNA_HMW_ratio <- ifelse(BeforeAfter_melt$variable == "cpa_tumorDNA", 0, as.numeric(BeforeAfter_melt$cfDNA_HMW_ratio))
+
+ggplot(BeforeAfter_melt, 
+       aes(col = colLabel, x = variable, y = value, group = PatientID, alpha = colLabel)) + 
+   geom_line(position = position_dodge(width = 0.5)) + 
+   geom_point(data = BeforeAfter_melt, position = position_dodge(width = 0.5), aes(size = cfDNA_HMW_ratio)) + 
+   scale_y_log10() + theme_bw() + 
+   facet_wrap(~TumorGroup, ncol = 2) + 
+   labs(size = "cfDNA/HMW ratio", x = "biomaterial", y = "CPAm") +
+   scale_color_manual(values=c("gray", "navyblue")) + 
+   scale_alpha_discrete(range = c(0.5, 0.9)) + theme(legend.position = "right")
+
+ggsave(paste0(plotfolder, "beforeAfter.png"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 9)
+ggsave(paste0(plotfolder, "beforeAfter.svg"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 9)
+ggsave(paste0(plotfolder, "beforeAfter.pdf"), plot = ggplot2::last_plot(), dpi = 300, width = 8, height = 9)
+
+cfDNAvsTissue$labelfig <- ifelse(cfDNAvsTissue$PatientID == "patient_079", "patient_079",
+                                 ifelse(cfDNAvsTissue$PatientID == "patient_212", "patient_212",
+                                        ifelse(cfDNAvsTissue$PatientID == "patient_077", "patient_077",
+                                               ifelse(cfDNAvsTissue$PatientID == "patient_196", "patient_196", ""))))
+p_CPAvsR <- ggplot(cfDNAvsTissue, aes(x =  as.numeric(cpa_cfDNA), y = pearsonR, size = as.numeric(cfDNA_HMW_ratio), shape = tumorDNA_assay_detail, col = tumorDNA_assay_detail, label = labelfig)) + 
+   geom_point(alpha = 1) + theme_bw() + 
+   labs(size = "cfDNA/HMW ratio", x = "CPAm cfDNA", y = "Pearson R", col = "tissue DNA platform", shape = "tissue DNA platform") + theme(legend.position="left")+
+   geom_vline(data=cfDNAvsTissue %>% filter(cpa_type == "CPAm"), aes(xintercept = FDR_CPAm), linetype = "dashed")+
+   annotate("rect",xmin = 0, xmax = FDR_CPAm, ymin = -Inf, ymax = Inf, alpha=0.3, fill="grey") + scale_shape_manual(values=c(1,1,1,1,1)) +
+   scale_color_manual(values = c("#F8766D", "#7CAE00", "#7CAE00", "#00BFC4", "#C77CFF")) + geom_text_repel(size = 4, show.legend = FALSE)
+
+#p_CPAvsR
+
+#ggarrange(CPAm_ridge, p_CPAvsR, legend = "bottom")
+```
+
+
+## Impact on neuroblastoma risk stratification {.tabset}
+### All samples
+
+```{r}
+MYCN <- sample_annotation %>% dplyr::filter(MYCN_amplification_cfDNA != "NA" & MYCN_amplification_tumor != "NA")
+sjt.xtab(MYCN$MYCN_amplification_cfDNA, MYCN$MYCN_amplification_tumor, var.labels=c("cfDNA", "tumor"), value.labels = list(c("MYCN neutral", "MYCN gain"), c("MYCN neutral", "MYCN gain")), show.cell.prc = TRUE, show.row.prc = TRUE, show.col.prc = TRUE)
+```
+
+### cfDNA/HMW ratio above 1
+```{r}
+MYCN_highqual <- MYCN %>% dplyr::filter(cfDNA_HMW_ratio > 1)
+sjt.xtab(MYCN_highqual$MYCN_amplification_cfDNA, MYCN_highqual$MYCN_amplification_tumor, var.labels=c("cfDNA", "tumor"), value.labels = list(c("MYCN neutral", "MYCN gain"), c("MYCN neutral", "MYCN gain")), show.cell.prc = TRUE, show.row.prc = TRUE, show.col.prc = TRUE)
+```
+
+
+## Impact on 1q gain in nephroblastoma {.tabset}
+### All samples
+
+```{r}
+nephr_1q <- sample_annotation %>% dplyr::filter(`gain_1q_WT_cfDNA` != "NA" & `gain_1q_WT_tumor`  != "NA")
+sjt.xtab(nephr_1q$`gain_1q_WT_cfDNA`, nephr_1q$`gain_1q_WT_tumor` , var.labels=c("cfDNA", "tumor"), value.labels = list(c("1q neutral", "1q gain"), c("1q neutral", "1q gain")), show.cell.prc = TRUE, show.row.prc = TRUE, show.col.prc = TRUE)
+```
+
+### cfDNA/HMW ratio above 1
+```{r}
+nephr_1q_highqual <- nephr_1q %>% dplyr::filter(cfDNA_HMW_ratio > 1)
+sjt.xtab(nephr_1q_highqual$`gain_1q_WT_cfDNA`, nephr_1q_highqual$`gain_1q_WT_tumor` , var.labels=c("cfDNA", "tumor"), value.labels = list(c("1q neutral", "1q gain"), c("1q neutral", "1q gain")), show.cell.prc = TRUE, show.row.prc = TRUE, show.col.prc = TRUE)
+```
+
+# Generalized Additive Modelling
+## Data cleaning
+
+
+```{r}
+library(sjPlot)
+library(gamm4)
+library(lme4)
+library(lmerTest)
+library(mgcv)
+library(tidymv)
+library(mgcViz)
+
+
+cfDNA_GAM <- L2Rcomparison %>% select(UniqueID, tumorDNA_assay_detail, TumorType, cfDNA_HMW_ratio, PatientID, metastatic, mean_abs_diff_log2,  CFD_ID,  L2R_cfDNA, L2R_tumorDNA, TumorGroup, id, plasma_prep_protocol, tumorDNA_assay_detail, SampleOrigin, delta_tissue_liquid)
+
+cfDNA_GAM <- cfDNA_GAM  %>% filter(TumorType %in% c(sample_annotation  %>% group_by(TumorType) %>% count() %>% filter(n >= 5) %>% pull(TumorType))) %>% filter(TumorGroup != "brain tumor")
+
+cfDNA_GAM$TumorType <- gsub(" ", "", cfDNA_GAM$TumorType)
+cfDNA_GAM$tumorDNA_assay_detail <- gsub(" ", "", cfDNA_GAM$tumorDNA_assay_detail)
+cfDNA_GAM$metastatic <- gsub(" ", "", cfDNA_GAM$metastatic)
+cfDNA_GAM$id <- as.factor(cfDNA_GAM$id)
+cfDNA_GAM$delta_tissue_liquid <- as.numeric(cfDNA_GAM$delta_tissue_liquid )
+```
+
+- Number of total observations `r cfDNA_GAM %>% nrow()`
+
+```{r}
+cfDNA_GAM <- cfDNA_GAM  %>% filter(metastatic != "NA")
+```
+
+- NUmber of observations after removing all NAs: `r cfDNA_GAM %>% filter(!is.na(mean_abs_diff_log2) & !is.na(cfDNA_HMW_ratio) & !is.na(tumorDNA_assay_detail) & !is.na(metastatic)) %>% nrow()`
+
+```{r}
+cfDNA_GAM$TumorType <- as.factor(cfDNA_GAM$TumorType)
+cfDNA_GAM$PatientID <- as.factor(cfDNA_GAM$PatientID)
+cfDNA_GAM$UniqueID <- as.factor(cfDNA_GAM$UniqueID)
+cfDNA_GAM$metastatic <- as.factor(cfDNA_GAM$metastatic)
+cfDNA_GAM$cfDNA_HMW_ratio_log10 <- log10(cfDNA_GAM$cfDNA_HMW_ratio)# + 0.001)
+cfDNA_GAM$tumorDNA_assay_detail <- as.factor(cfDNA_GAM$tumorDNA_assay_detail)
+cfDNA_GAM$plasma_prep_protocol <- as.factor(cfDNA_GAM$plasma_prep_protocol)
+
+cfDNA_GAM$quality_score <- ifelse(cfDNA_GAM$cfDNA_HMW_ratio < 1, "low",
+                                  ifelse(cfDNA_GAM$cfDNA_HMW_ratio < 5 & cfDNA_GAM$cfDNA_HMW_ratio > 1, "medium", "high"))
+cfDNA_GAM$quality_score <- as.factor(cfDNA_GAM$quality_score)
+
+```
+
+## Model specification
+```{r}
+if (!file.exists("L2RcfDNA_model_paper.rda")){
+   Model <- bam(L2R_cfDNA ~ L2R_tumorDNA*tumorDNA_assay_detail + L2R_tumorDNA*cfDNA_HMW_ratio_log10 + L2R_tumorDNA*TumorType + L2R_tumorDNA*metastatic + s(PatientID, bs = "re"), data = cfDNA_GAM, nthreads = 3, family = scat(), discrete = TRUE, method = "fREML", gc.level = 2, drop.intercept = FALSE)
+   saveRDS(Model, "L2RcfDNA_model_paper.rda")
+} else {
+   Model <- readRDS("L2RcfDNA_model_paper.rda")
+}
+```
+
+## Summary
+```{r}
+#summary(Model)
+
+#plot_model(Model, show.values = TRUE, value.offset = .3)
+
+plot_model(Model, type = "est") + theme_bw()
+ggsave("est.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+plot_model(Model, type = "pred")+ theme_bw()
+ggsave("pred.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+#qual_interaction <- plot_model(Model, type = "pred", terms = c("L2R_tumorDNA","cfDNA_HMW_ratio_log10 [0:1 by = 0.1]")) + geom_abline(slope = 1, intercept = 0, linetype = "dashed")+ theme_bw() + labs(col = "cfDNA/HMW ratio (log10)", title = "predicted values of log2(ratio) in cfDNA", y = "log2(ratio) in cfDNA", x = "log2(ratio) in tumor DNA")
+library(ggeffects)
+mydf <- ggpredict(Model,terms = c("L2R_tumorDNA","cfDNA_HMW_ratio_log10 [0:2 by = 0.08]"))
+
+qual_interaction <-  ggplot(mydf, aes(x, predicted, group = group, col = as.numeric(group))) +
+   geom_line(size = 4) + theme_bw() + labs(col = "cfDNA/HMW ratio (log10)", title = "predicted values of log2(ratio) in cfDNA", y = "log2(ratio) in cfDNA", x = "log2(ratio) in tumor DNA")+ geom_abline(slope = 1, intercept = 0, linetype = "dashed")
+
+ggsave("pred_ratio.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+plot_model(Model, type = "pred", terms = c("L2R_tumorDNA", "TumorType"))+ geom_abline(slope = 1, intercept = 0, linetype = "dashed")+ theme_bw()
+ggsave("pred_type.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+plot_model(Model, type = "pred", terms = c("TumorType", "L2R_tumorDNA [-0.1, 0 , 0.1]"))+ theme_bw()
+ggsave("pred_type2.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+plot_model(Model, type = "pred", terms = c("L2R_tumorDNA", "tumorDNA_assay_detail"))+ geom_abline(slope = 1, intercept = 0, linetype = "dashed")+ theme_bw()
+ggsave("pred_assay.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+plot_model(Model, type = "pred", terms = c("L2R_tumorDNA", "metastatic")) + geom_abline(slope = 1, intercept = 0, linetype = "dashed")+ theme_bw()
+ggsave("pred_meta.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+plot_model(Model, type = "pred", terms = c("metastatic", "L2R_tumorDNA [-0.1, 0 , 0.1]"))+ theme_bw()
+ggsave("pred_meta2.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+
+#plot_model(Model, type = "slope", show.loess = FALSE)+ theme_bw()
+#ggsave("pred_slope.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+
+#plot_model(Model, type = "resid", show.loess = FALSE)+ theme_bw()
+#ggsave("pred_resid.png", plot <- ggplot2::last_plot(), width = 10, height = 10)
+```
+
+## Visualisation of assumptions
+```{r}
+v <- getViz(Model)
+print(plot(v) + l_points() + l_fitLine(), pages = 1)
+
+check(v, a.hist = list(bins  = 100), a.respoi = list(alpha = 0.1))
+```
+
+## Regression coefficient table
+
+```{r}
+tab_model(Model, show.reflvl = TRUE, digits = 4,  file = "table_GAM.html")
+```
+
+
+# Heatmap {.tabset}
+
+```{r,, results='hide'}
+
+df_heatmap_init = df_heatmap_init %>% select(-c(meanLog2))
+
+# params to test function with
+#sample_select <- c("nephroblastoma", "Ewing sarcoma", "rhabdomyosarcoma")
+#width_px = 1200
+#height_px = 1800
+#sample_select <- "nephroblastoma"
+
+makeHeatmap <- function(df_heatmap_init, sample_select, width_px, height_px, arrangehm = "tumor"){
+   #df_heatmap = df_heatmap_init %>% filter(str_detect(SampleID, neuroblastoma))
+   df_heatmap <- df_heatmap_init
+   df_heatmap$bin <- paste0(as.character(df_heatmap$chr), ":", as.character(df_heatmap$start), "-", as.character(df_heatmap$end))
+   
+   
+   df_heatmap <- df_heatmap %>% select(-c(chr, start, end)) %>% group_by(SampleID) %>% distinct(bin, .keep_all = TRUE) %>% ungroup() %>% spread(key = c(bin), value = ratio)
+   df_heatmap <- df_heatmap %>% 
+      select(where(~!any(is.na(.))))
+   #df_heatmap <- df_heatmap %>% distinct(SampleID, .keep_all = TRUE)
+   
+   colnames_hm <- paste0(gsub(":.*", "", colnames(df_heatmap[,2:ncol(df_heatmap)])))
+   colnames_hm <- factor(colnames_hm, levels = chr_order)
+   rownames_hm <- df_heatmap$SampleID
+   
+   
+   sampleTypes <- sample_annotation_long %>% filter(SampleID  %in% rownames_hm)
+   
+   sampleTypes <- sampleTypes %>% dplyr::arrange(PatientID)
+   
+   df_heatmap <- inner_join(sampleTypes, df_heatmap)
+   if (arrangehm == "pearsonR"){
+      df_heatmap <- df_heatmap %>% dplyr::arrange(desc(pearsonR),PatientID, TumorType)
+   }else{
+      df_heatmap <- df_heatmap %>% dplyr::arrange(PatientID, TumorType)
+   }
+   df_heatmap <- df_heatmap %>% distinct(SampleID, `1:100400001-100600000`, 
+                                         `1:107200001-107400000`,
+                                         `1:113000001-113200000`,
+                                         `1:117800001-118000000`, .keep_all = TRUE)
+   if (arrangehm == "pearsonR"){
+      df_heatmap <- df_heatmap %>% filter(PatientID %in% sample_select)
+   } else{
+      df_heatmap <- df_heatmap %>% filter(TumorType %in% sample_select)
+   }
+   
+   df_heatmap$pearsonR <- round(df_heatmap$pearsonR, 2)
+   #df_heatmap$pearsonR <- ifelse(df_heatmap$biomaterial == "cfDNA", NA, df_heatmap$pearsonR)
+   #    cbind(sample_annotation$sWGS, sample_annotation$TumorType, rep("sWGS", nrow(sample_annotation))),
+   #    cbind(sample_annotation$array, sample_annotation$TumorType, rep("array", nrow(sample_annotation)))
+   # ))
+   # colnames(sampleTypes) <- c("SampleID", "tumor", "type")
+   
+   ht_opt(
+      legend_title_gp = gpar(fontsize = 20, fontface = "bold"),
+      legend_labels_gp = gpar(fontsize = 20),
+      ROW_ANNO_PADDING = unit(8,"mm")
+   )
+   
+   tumor_col <- colorRampPalette(colors = brewer.pal(12, "Paired")) (length(levels(as.factor(df_heatmap$TumorType))))
+   names(tumor_col) <- levels(as.factor(df_heatmap$TumorType))
+   
+   platform_col <- colorRampPalette(colors = brewer.pal(9, "Set1")) (length(levels(as.factor(df_heatmap$assayDetail))))
+   names(platform_col) <- levels(as.factor(df_heatmap$assayDetail))
+   
+   biomat_col <- colorRampPalette(colors = brewer.pal(3, "Set3")) (length(levels(as.factor(df_heatmap$biomaterial))))
+   names(biomat_col) <- levels(as.factor(df_heatmap$biomaterial))
+   
+   source_col <- colorRampPalette(colors = brewer.pal(5, "Set2")) (length(levels(as.factor(df_heatmap$source))))
+   names(source_col) <- levels(as.factor(df_heatmap$source))
+   
+   pearsonR_col <- colorRamp2(c(-0.1, 1), colors = c("white", "#165a7d"))
+   
+   delta_tissue_liquid_col <- colorRamp2(c(-1000,1000), colors = c("lightgray", "lightgray"))
+   
+   ha = HeatmapAnnotation(
+      samplingDelay = anno_simple(df_heatmap$delta_tissue_liquid, pch = as.character(df_heatmap$delta_tissue_liquid), pt_size = unit(4,"mm"), col = delta_tissue_liquid_col),
+      CPAm = anno_barplot(df_heatmap$CPAm, gp = gpar(fill = 2, col = 2)),
+      pearsonR = anno_simple(df_heatmap$pearsonR, pch = as.character(df_heatmap$pearsonR), pt_size = unit(4,"mm"), col = pearsonR_col),
+      platform = df_heatmap$assayDetail,
+      col = list(platform = platform_col, biomaterial = biomat_col, tumor = tumor_col, source = source_col, delta_tissue_liquid = delta_tissue_liquid_col),
+      biomaterial = df_heatmap$biomaterial,
+      tumor = df_heatmap$TumorType,
+      source  = df_heatmap$source,
+      annotation_name_side = "bottom", which = "row", show_legend = TRUE,
+      width = unit(7.5, "cm"),
+      gap = unit(0.5, "mm"),
+      show_annotation_name = TRUE,
+      simple_anno_size = unit(0.8, "cm"),
+      annotation_legend_param = 
+         list(
+            platform = list(
+               title = "platform"
+            ),
+            biomaterial = list(
+               title = "biomaterial"
+            ),
+            tumor = list(
+               title = "tumor", 
+               ncol = 1
+            ),
+            source = list(
+               title = "source", 
+               ncol = 1
+            )
+         ))
+   
+   loss <- wes_palette("Zissou1")[1]
+   gain <- wes_palette("Zissou1")[5]
+   neutral <- "#F1F1F1"
+   hm_q <- quantile(df_heatmap[,12:ncol(df_heatmap)], na.rm = TRUE, probs = c(0.01, 0.99))
+   col_fun = colorRamp2(c(hm_q[1], 0, hm_q[2]), c(loss, neutral, gain))
+   
+
+   
+   if (arrangehm == "pearsonR"){
+      hm_df <- as.matrix(df_heatmap[,13:ncol(df_heatmap)])
+      rownames(hm_df) <- as.factor(df_heatmap$pearsonR)
+      arr <- order((rownames(hm_df)))
+      split <- c(rep(1, nrow(hm_df)/2), rep(2, nrow(hm_df)/2))
+      row_gap <- 5
+      filename <- "_pearsonR_"
+      hm_df <- hm_df[,2:ncol(hm_df)]
+   } else {
+      hm_df <- as.matrix(df_heatmap[,14:ncol(df_heatmap)])
+      rownames(hm_df) <- as.factor(df_heatmap$pearsonR)
+      arr <- NULL
+      split <- df_heatmap$PatientID
+      row_gap <- 0.4
+      filename <- "_bytumor_"
+   }
+   ht <- Heatmap(hm_df, 
+                 name = "log2ratio", column_split = colnames_hm, row_split = split,
+                 col =   col_fun,
+                 row_title = FALSE,
+                 row_gap = unit(row_gap, "mm"),
+                 cluster_columns = FALSE, 
+                 cluster_rows = FALSE,
+                 show_column_names = FALSE,
+                 show_row_names = TRUE, 
+                 row_labels = df_heatmap$PatientID, 
+                 row_order = arr,
+                 right_annotation = ha,
+                 column_title_gp = gpar(fontsize = 10),
+                 column_gap = unit(1, "mm"))
+   png(paste0(plotfolder, "heatmap", filename, sample_select[1], ".png"), width = width_px, height = height_px, pointsize = 14 )
+   map <- draw(ht, heatmap_legend_side = "bottom")
+   dev.off()
+   
+}
+library(data.table)
+
+# to add middle 10
+#pearson_vect <- c(sample_annotation_long %>% arrange(desc(pearsonR)) %>% head(n = 20) %>% pull(PatientID), setorder(data.table(sample_annotation_long), pearsonR)[(.N/2 - 20/2):(.N/2 + 20/2 - 1), ] %>% pull(PatientID), sample_annotation_long %>% arrange(desc(pearsonR)) %>% filter(!is.na(pearsonR)) %>% tail(n = 20) %>% pull(PatientID))
+
+pearson_vect <- c(sample_annotation_long %>% filter(PatientID != "patient_101") %>% arrange(desc(pearsonR)) %>% head(n = 30) %>% pull(PatientID), sample_annotation_long %>% filter(PatientID != "patient_101") %>% arrange(desc(pearsonR)) %>% filter(!is.na(pearsonR)) %>% tail(n = 30) %>% pull(PatientID))
+
+makeHeatmap(df_heatmap_init = df_heatmap_init, pearson_vect, width_px = 1200, height_px = 1400, arrangehm = "pearsonR")
+```
+
+## Adrenal tumors
+
+```{r}
+makeHeatmap(df_heatmap_init = df_heatmap_init, c("neuroblastoma", "ganglioneuroblastoma"), width_px = 1200, height_px = 2200)
+```
+
+![heatmap neuroblastoma and ganglioneuroblastoma](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/heatmap_bytumor_neuroblastoma.png)
+
+## Sarcomas
+
+```{r}
+makeHeatmap(df_heatmap_init = df_heatmap_init, c("osteosarcoma", "Ewing sarcoma", "rhabdomyosarcoma"), width_px = 1200, height_px = 1000)
+```
+
+
+![heatmap rhabdomyosarcoma, Ewing sarcoma and rhabdomyosarcoma](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/heatmap_bytumor_osteosarcoma.png)
+
+## Kidney tumors
+
+```{r}
+makeHeatmap(df_heatmap_init = df_heatmap_init, c("nephroblastoma", "kidney sarcoma", "malignant rhabdoid tumor of the kidney", "renal cell carcinoma"), width_px = 1200, height_px = 1200)
+```
+
+![heatmap nephroblastoma, kidney sarcoma, MRTK and RCC](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/heatmap_bytumor_nephroblastoma.png)
+
+## Brain tumors
+
+```{r}
+makeHeatmap(df_heatmap_init = df_heatmap_init, c("medulloblastoma", "ATRT", "PNET", "astrocytic pilocytoma", "ependymoma", "ganglioglioma", "glioblastoma", "hemangioblastoma", "meningeoma"), width_px = 1200, height_px = 800)
+```
+
+![heatmap brain tumors](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/heatmap_bytumor_medulloblastoma.png)
+
+
+# Hetereogeneity plots
+
+For several samples, tumor sections from multiple locations in the tumor were present. The figures below give the 20 Mb rolling mean of these log2(ratios):
+
+## Patient 50
+
+Pathology:
+
+- Location 1 & 3: Sarcoma of kidney
+- ! Note: location "2" on the CNA plot equals location "3" on the histology slide.
+
+Tumor samples were obtained 4 days after the cfDNA sample.
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/data/figures_CZ/patient_50/patient50_combined.jpg)
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots/patient_050_CFD1806845_2E61_heterogen.png)
+
+## Patient 53
+
+Pathology:
+
+- Location 1,2,3: Blastemic nephroblastoma
+
+Tumor samples were obtained 10 days after the cfDNA sample.
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/data/figures_CZ/patient_53/patient_53_combined.jpg)
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots/patient_053_CFD1806848_2E71_heterogen.png)
+
+## Patient 54
+
+Pathology:
+
+- Location 1,2,3: Triphasic nephroblastoma with a predominance of blastema
+
+Tumor samples were obtained 26 days after the cfDNA sample.
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/data/figures_CZ/patient_54/patient_54_combined.jpg)
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots/patient_054_CFD1806849_2L42_heterogen.png)
+
+## Patient 56
+
+Pathology:
+
+- Location 1: Triphasic nephroblastoma with foci of necrosis
+- Location 2: Triphasic nephroblastoma with necrosis
+- Location 3: Kidney with nephrogenic blastema
+
+Tumor samples were obtained 28 days after the cfDNA sample.
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/data/figures_CZ/Patient_56/patient_56_combined.jpg)
+
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots/patient_056_CFD1806851_2S88_heterogen.png)
+
+
+## Patient 57
+
+Pathology:
+
+- Location 1: Triphasic nephroblastoma with rhabdomyoblastic differentiation
+- Location 2: necrosis
+- Location 3: Triphasic nephroblastoma with rhabdomyoblastic differentiation
+
+Tumor samples were obtained 1 day after the cfDNA sample.
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/data/figures_CZ/Patient_57/patient_57_combined.jpg)
+
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots/patient_057_CFD1806852_2G05_heterogen.png)
+
+
+```{r, include = FALSE, echo = FALSE}
+datadir_sWGS_cfDNA <- "./data/sWGS_cfDNA/"
+datadir_sWGS_tissue <- "./data/sWGS_tissue/"
+datadir_arrayBE <- "./data/array/"
+datadir_arrayCZ <- "./data/SNParray/"
+binsize = "200kb"
+
+datadir1 = datadir_sWGS_cfDNA
+datadir2 = datadir_arrayCZ
+#sample1 = "CFD1806851"
+##sample2 = "2S88"
+#sample3 = "2S89"
+#sample4 = "2S90"
+
+library(ggtext)
+makeCNVcomparison <- function(datadir1, datadir2, sample1, sample2, sample3, sample4, patientID, nsamp){
+   
+   
+   bins_sample1 <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "bins_mask")), col_types = c("fdd?d"),
+                            col_names = c("chr", "start", "end", "id", "ratio"), skip = 1)
+   bins_sample1 <- bins_sample1 %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   
+   
+   bins_sample2 <-  read_tsv(paste0(datadir2,"/",sample2,"_", binsize, ".tsv"), col_types = c("fddd"),
+                             col_names = c("chr", "start", "end", "ratio"))
+   bins_sample2 <- bins_sample2 %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   bins_sample2$chr <- factor(bins_sample2$chr, levels = chr_order)
+   
+   bins_sample3 <-  read_tsv(paste0(datadir2,"/",sample3,"_", binsize, ".tsv"), col_types = c("fddd"),
+                             col_names = c("chr", "start", "end", "ratio"))
+   bins_sample3 <- bins_sample3 %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   bins_sample3$chr <- factor(bins_sample3$chr, levels = chr_order)
+   
+   if (nsamp == 4){
+   bins_sample4 <-  read_tsv(paste0(datadir2,"/",sample4,"_", binsize, ".tsv"), col_types = c("fddd"),
+                             col_names = c("chr", "start", "end", "ratio"))
+   bins_sample4 <- bins_sample4 %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   bins_sample4$chr <- factor(bins_sample4$chr, levels = chr_order)
+   }
+   
+   segs_sample1 <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "segments_mask.bed")), col_types = c("fdddd"),
+                            col_names = c("chr", "start", "end", "ratio", "zscore"))
+   segs_sample1 <- segs_sample1 %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample1)
+
+   
+   segs_sample2 <- read_tsv(paste0(datadir2,"/",sample2,"_segments_per_", binsize, "_mask.tsv"), col_types = c("fddd"),
+                            col_names = c("chr", "start", "end", "ratio"), skip = 1)
+   
+   segs_sample2 <- segs_sample2 %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample2)
+   segs_sample2$chr <- factor(segs_sample2$chr, levels = chr_order)
+   
+   segs_sample3 <- read_tsv(paste0(datadir2,"/",sample3,"_segments_per_", binsize, "_mask.tsv"), col_types = c("fddd"),
+                            col_names = c("chr", "start", "end", "ratio"), skip = 1)
+   
+   segs_sample3 <- segs_sample3 %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample2)
+   segs_sample3$chr <- factor(segs_sample3$chr, levels = chr_order)
+   if (nsamp == 4){
+      segs_sample4 <- read_tsv(paste0(datadir2,"/",sample4,"_segments_per_", binsize, "_mask.tsv"), col_types = c("fddd"),
+                               col_names = c("chr", "start", "end", "ratio"), skip = 1)
+      
+      segs_sample4 <- segs_sample4 %>% filter(!chr %in% c("X", "Y", "23", "24")) %>% mutate(Sample = sample2)
+      segs_sample4$chr <- factor(segs_sample4$chr, levels = chr_order)
+   }
+   
+   
+   color_cfDNA <- wes_palette("Cavalcanti1")[1]
+   color_tumorDNA <- wes_palette("Cavalcanti1")[4]
+   color_abberations <- wes_palette("Cavalcanti1")[5]
+   
+   col_s1 <- "#5A469C"#wes_palette("Royal1")[1]
+   col_s2 <- "#E15558" # wes_palette("Royal1")[2]
+   col_s3 <- "#4BB845" #wes_palette("Royal2")[4]
+   if (nsamp == 4){
+   col_s4 <- "#E3CA55" #wes_palette("Royal1")[4]
+   }
+   
+   cpa_s1 <- round(get.cpa.modified2(segs_sample1),4)
+   cpa_s2 <- round(get.cpa.modified2(segs_sample2),4)
+   cpa_s3 <- round(get.cpa.modified2(segs_sample3),4)
+   if (nsamp == 4){
+   cpa_s4 <- round(get.cpa.modified2(segs_sample4),4)
+   }
+   
+   corplot_df_bins <- inner_join(bins_sample1, bins_sample2, by = c("chr", "start", "end"))
+   corplot_df_bins <- inner_join(corplot_df_bins, bins_sample3, by = c("chr", "start", "end"))
+   if (nsamp == 4){
+    corplot_df_bins <- inner_join(corplot_df_bins, bins_sample4, by = c("chr", "start", "end"))
+   }
+   #corplot_df <- corplot_df %>% filter(!is.na(ratio.x) & !is.na(ratio.y))
+   
+   if (nsamp == 4){
+   corplot_df_bins <- corplot_df_bins %>%
+      mutate(rM.s1=rollapply(ratio.x,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) %>%
+      mutate(rM.s2=rollapply(ratio.y,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right"))  %>%
+      mutate(rM.s3=rollapply(ratio.x.x,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right"))  %>%
+      mutate(rM.s4=rollapply(ratio.y.y,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) 
+   } else {
+      corplot_df_bins <- corplot_df_bins %>%
+      mutate(rM.s1=rollapply(ratio.x,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) %>%
+      mutate(rM.s2=rollapply(ratio.y,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right"))  %>%
+      mutate(rM.s3=rollapply(ratio,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) 
+   }
+   
+   if (nsamp == 4){
+   max.ratio_roll <- max(c(corplot_df_bins$ratio.x, corplot_df_bins$ratio.y, corplot_df_bins$ratio.x.x, corplot_df_bins$ratio.y.y), na.rm = TRUE)
+   min.ratio_roll <- min(c(corplot_df_bins$ratio.x, corplot_df_bins$ratio.y, corplot_df_bins$ratio.x.x, corplot_df_bins$ratio.y.y), na.rm = TRUE)
+   } else {
+   max.ratio_roll <- max(c(corplot_df_bins$ratio.x, corplot_df_bins$ratio.y, corplot_df_bins$ratio), na.rm = TRUE)
+   min.ratio_roll <- min(c(corplot_df_bins$ratio.x, corplot_df_bins$ratio.y, corplot_df_bins$ratio), na.rm = TRUE)
+   }
+   
+   patientID_title <- gsub("_", " ", patientID)
+      
+   if (nsamp == 4){
+   colors <- c("cfDNA" = col_s1, "location 1" = col_s2, "location 2" = col_s3, "location 3" = col_s4) 
+   loc3_line <- geom_line(aes(y=rM.s4, col = "location 3"), alpha = 0.8, size = 0.6)
+   plottitle <- labs(
+         title = paste0(patientID_title, "
+                      \n",
+                      "<span> CPAm:
+       <span style='color:",col_s1 ,";'>", round(cpa_s1,2), "</span> - 
+       <span style='color:",col_s2 ,";'>", round(cpa_s2,2), "</span> -
+       <span style='color:",col_s3 ,";'>", round(cpa_s3,2), "</span> -
+       <span style='color:",col_s4 ,";'>", round(cpa_s4,2), "</span>
+       </span>"
+         ))
+   } else {
+   colors <- c("cfDNA" = col_s1, "location 1" = col_s2, "location 2" = col_s3) 
+   loc3_line <- NULL
+   plottitle <- 
+      labs(
+         title = paste0(patientID_title, "
+                      \n",
+                      "<span> CPAm:
+       <span style='color:",col_s1 ,";'>", round(cpa_s1,2), "</span> - 
+       <span style='color:",col_s2 ,";'>", round(cpa_s2,2), "</span> -
+       <span style='color:",col_s3 ,";'>", round(cpa_s3,2), "</span>
+       </span>"
+         ))
+   }
+   
+   #patientID_title <- gsub("p", "P", patientID)
+   
+   rollmean <- ggplot(tibble(corplot_df_bins), aes(x = start)) + 
+      theme_bw() + 
+      labs(y = "log2(ratio)", x = "chromosomes") + lims(y = c(-1,1)) +
+      geom_line(aes(y=rM.s1, col = "cfDNA"), alpha = 1, size = 0.6) +
+      geom_line(aes(y=rM.s2, col = "location 1"), alpha = 0.8, size = 0.6) +
+      geom_line(aes(y=rM.s3, col = "location 2"), alpha = 1, size = 0.6) +
+      loc3_line +
+      theme(panel.spacing.x = unit(0, "lines"),
+            panel.spacing.y = unit(0, "lines"),
+            #  axis.title.x =  element_blank(),
+            axis.text.x =  element_blank(),
+            axis.ticks.x =  element_blank(),
+            strip.background = element_rect(color = "white", fill = "white"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank()) + 
+      geom_hline(yintercept = 0, linetype = "dashed", col = "gray") +
+      facet_wrap(~chr, strip.position = "bottom", scales ="free_x", nrow = 1)+labs(col = NULL) +
+      scale_color_manual(values = colors) + theme(legend.position = "bottom") +
+      plottitle+
+      theme(
+         plot.title = element_markdown(lineheight = 1.1),
+         legend.text = element_markdown(size = 15),
+         legend.key.size = unit(3,"line")
+      )
+   # + lims(y = c(-NA,NA))
+   
+   
+   ggsave(paste0(plotfolder, patientID, "_", sample1, "_", sample2, "_heterogen.png"), plot = rollmean, width = 10, height = 4, dpi = 300)
+}
+
+datadir1 = datadir_sWGS_cfDNA
+datadir2 = datadir_arrayCZ
+sample1 = "CFD1806851"
+sample2 = "2S88"
+sample3 = "2S89"
+sample4 = "2S90"
+heterosamp = 2
+patientID = sample_annotation_full %>% filter(tumorDNA_ID == sample2) %>% pull(PatientID)
+makeCNVcomparison(datadir1, datadir2, sample1, sample2, sample3, sample4, patientID, nsamp = 4)
+
+sample1 = "CFD1806852"
+sample2 = "2G05"
+sample3 = "2G06"
+sample4 = "2G07"
+heterosamp = heterosamp + 2
+patientID = sample_annotation_full %>% filter(tumorDNA_ID == sample2) %>% pull(PatientID)
+makeCNVcomparison(datadir1, datadir2, sample1, sample2, sample3, sample4, patientID, nsamp = 4)
+
+sample1 = "CFD1806845"
+sample2 = "2E61"
+sample3 = "2E63"
+heterosamp = heterosamp + 1
+patientID = sample_annotation_full %>% filter(tumorDNA_ID == sample2) %>% pull(PatientID)
+makeCNVcomparison(datadir1, datadir2, sample1, sample2, sample3, sample4, patientID, nsamp = 3)
+
+sample1 = "CFD1806848"
+sample2 = "2E71"
+sample3 = "2E73"
+sample4 = "2E73"
+heterosamp = heterosamp + 2
+patientID = sample_annotation_full %>% filter(tumorDNA_ID == sample2) %>% pull(PatientID)
+makeCNVcomparison(datadir1, datadir2, sample1, sample2, sample3, sample4, patientID, nsamp = 4)
+
+sample1 = "CFD1806849"
+sample2 = "2L42"
+sample3 = "2L43"
+sample4 = "2L44"
+heterosamp = heterosamp + 2
+patientID = sample_annotation_full %>% filter(tumorDNA_ID == sample2) %>% pull(PatientID)
+makeCNVcomparison(datadir1, datadir2, sample1, sample2, sample3, sample4, patientID, nsamp = 4)
+```
+
+# Cerebrospinal fluid samples
+For patient 101, we had CSF collected in standard, plastic tubes and Streck DNA tubes, as well as plasma collected in EDTA tubes and Streck DNA tubes.
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/_CFD1802291_CFD1802292_FALSE_CSF.png)
+
+Zoomed in to chr4, chr 6 and chr7:
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/_CFD1802291_CFD1802292_TRUE_CSF.png)
+The corresponding tumor showed loss of chr6 as well. However, the chr19 gain is not present in any of the liquids.
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/patient_101_M1A800108_D1806365_200kb.png)
+
+For two other patients, we collected CSF into standard, clear plastic tubes:
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/patient_098_CFD1704191_D1907634_200kb.png)
+
+![](/Users/rmvpaeme/Repos/RVPCVP2012_sWGS/plots_paper/patient_099_CFD1804680_D1901712_200kb.png)
+
+
+```{r}
+makeCNVcomparison_CSF <- function(datadir1, datadir2, sample1, sample2, sample3, sample4, zoom = FALSE){
+   
+   bins_sample1 <- read_tsv(paste0(datadir1, str_subset(dir(datadir1, pattern = sample1), "bins_mask")), col_types = c("fdd?d"),
+                            col_names = c("chr", "start", "end", "id", "ratio"), skip = 1)
+   bins_sample1 <- bins_sample1 %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   
+   
+   bins_sample2 <- read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample2), "bins_mask")), col_types = c("fdd?d"),
+                            col_names = c("chr", "start", "end", "id", "ratio"), skip = 1)
+   bins_sample2 <- bins_sample2 %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   bins_sample2$chr <- factor(bins_sample2$chr, levels = chr_order)
+   
+   bins_sample3 <-  read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample3), "bins_mask")), col_types = c("fdd?d"),
+                             col_names = c("chr", "start", "end", "id", "ratio"), skip = 1)
+   bins_sample3 <- bins_sample3 %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   bins_sample3$chr <- factor(bins_sample3$chr, levels = chr_order)
+   
+   bins_sample4 <-  read_tsv(paste0(datadir2, str_subset(dir(datadir2, pattern = sample4), "bins_mask")), col_types = c("fdd?d"),
+                             col_names = c("chr", "start", "end", "id", "ratio"), skip = 1)
+   bins_sample4 <- bins_sample4 %>% filter(!chr %in% c("X", "Y", "23", "24"))
+   bins_sample4$chr <- factor(bins_sample4$chr, levels = chr_order)
+   
+   color_cfDNA <- wes_palette("Cavalcanti1")[1]
+   color_tumorDNA <- wes_palette("Cavalcanti1")[4]
+   color_abberations <- wes_palette("Cavalcanti1")[5]
+   
+   col_s1 <- wes_palette("Darjeeling1")[1]
+   col_s2 <- wes_palette("Darjeeling1")[2]
+   col_s3 <- wes_palette("Darjeeling2")[2]
+   col_s4 <- wes_palette("Darjeeling2")[3]
+   max.ratio_bins <- max(c(bins_sample1$ratio, bins_sample2$ratio, bins_sample3$ratio, bins_sample4$ratio), na.rm = TRUE)
+   min.ratio_bins <- min(c(bins_sample1$ratio, bins_sample2$ratio, bins_sample3$ratio, bins_sample4$ratio), na.rm = TRUE)
+   
+   
+   corplot_df_bins <- inner_join(bins_sample1, bins_sample2, by = c("chr", "start", "end"))
+   corplot_df_bins <- inner_join(corplot_df_bins, bins_sample3, by = c("chr", "start", "end"))
+   corplot_df_bins <- inner_join(corplot_df_bins, bins_sample4, by = c("chr", "start", "end"))
+   #corplot_df <- corplot_df %>% filter(!is.na(ratio.x) & !is.na(ratio.y))
+   
+   corplot_df_bins <- corplot_df_bins %>%
+      mutate(rM.s1=rollapply(ratio.x,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) %>%
+      mutate(rM.s2=rollapply(ratio.y,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right"))  %>%
+      mutate(rM.s3=rollapply(ratio.x.x,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right"))  %>%
+      mutate(rM.s4=rollapply(ratio.y.y,100, FUN=function(x) mean(x, na.rm=TRUE), fill=NA, align="right")) 
+   
+   
+   colors <- c("EDTA plasma" = col_s1, "Streck plasma" = col_s2, "CSF" = col_s3, "Streck CSF" = col_s4)
+   if (zoom == TRUE){
+   plot_cmd <- ggplot(tibble(corplot_df_bins) %>% filter(chr == "6" | chr == "5" | chr == "7"), aes(x = start)) 
+   } else {
+    plot_cmd <- ggplot(tibble(corplot_df_bins), aes(x = start))
+   }
+      rollmean <- plot_cmd +
+      theme_bw() + 
+      labs(y = "log2(ratio)", x = "chromosomes") + lims(y = c(-1,1)) +
+      geom_line(aes(y=rM.s1, col = "EDTA plasma"), alpha = 0.7, size = 0.6) +
+      geom_line(aes(y=rM.s2, col = "Streck plasma"), alpha = 0.7, size = 0.6) +
+      geom_line(aes(y=rM.s3, col = "CSF"), alpha = 0.7, size = 0.6) +
+      geom_line(aes(y=rM.s4, col = "Streck CSF"), alpha = 0.9, size = 0.6) +
+      theme(panel.spacing.x = unit(0, "lines"),
+            panel.spacing.y = unit(0, "lines"),
+            #  axis.title.x =  element_blank(),
+            axis.text.x =  element_blank(),
+            axis.ticks.x =  element_blank(),
+            strip.background = element_rect(color = "white", fill = "white"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank()) + 
+      geom_hline(yintercept = 0, linetype = "dashed", col = "gray") +
+      facet_wrap(~chr, strip.position = "bottom", scales ="free_x", nrow = 1)+labs(col = NULL) +
+      scale_color_manual(values = colors) + theme(legend.position = "bottom") + lims(y = c(-1,0.2))
+   
+   
+   rollmean <- rollmean + theme(legend.text=element_text(size=15)) + theme(legend.key.size = unit(3,"line"))
+   rollmean
+   ggsave(paste0(plotfolder, patientID, "_", sample1, "_", sample2, "_", zoom, "_CSF.png"), plot = rollmean, width = 10, height = 4, dpi = 300)
+}
+
+datadir1 = datadir_sWGS_cfDNA
+datadir2 = datadir_sWGS_cfDNA
+sample1 = "CFD1802291"
+sample2 = "CFD1802292"
+sample3 = "M1A800108"
+sample4 = "MMA1800016"
+patientID = sample_annotation_full %>% filter(tumorDNA_ID == sample2) %>% pull(PatientID)
+p1 <- makeCNVcomparison_CSF(datadir1, datadir2, sample1, sample2, sample3, sample4)
+p2 <- makeCNVcomparison_CSF(datadir1, datadir2, sample1, sample2, sample3, sample4, zoom = TRUE)
+```
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+
+
+
+# Manuscript figures
+
+```{r, fig.width = 6, fig.height= 8}
+p <- ggarrange(ridgeplot_cfDNA_per_tumor, ridgeplot_tissueDNA_per_tumor, qual_interaction  + 
+                 theme(strip.text.x = element_blank(),
+                       strip.background = element_rect(colour="white", fill="white"),
+                       legend.position=c(0.3,0.85), legend.title = element_text(size = 8),
+                 )  +
+                 scale_color_continuous(breaks = c(0, 10, 20), labels = c("1", "10", "100")) + labs(title = NULL, col = "cfDNA/HMW ratio"), ncol = 3, labels = c("B", "C", "D"), widths = c(0.30,0.20, 0.30))
+
+p_arr <- ggarrange(p_CPAvsR, p, nrow = 2, labels = c("A"), common.legend = FALSE)
+
+ggsave(paste0(plotfolder, "facetplot.png"), plot = ggplot2::last_plot(), dpi = 300, width = 9, height = 13)
+```
+
+# Result section in RMarkdown
+The results section was written in Rmarkdown, the numbers were pulled immediately from the dataframes in this RMarkdown file. For the code, see the `.Rmd` file (as opposed to the `.html` file).
+
+**Sample collection.** We retrospectively included `r (sample_annotation %>% pull(CFD_ID) %>% unique() %>% length() + sample_annotation %>% pull(tumorDNA_ID) %>% unique() %>% length()) + heterosamp` unique samples (n = `r sample_annotation %>% filter(CFD_biomaterial == "plasma") %>% pull(CFD_ID) %>% unique() %>% length()` plasma, n = `r sample_annotation %>% filter(CFD_biomaterial == "CSF") %>% pull(CFD_ID) %>% unique() %>% length()` CSF, n = `r sample_annotation %>% pull(tumorDNA_ID) %>% unique() %>% length() + heterosamp` tumor tissue) of `r sample_annotation %>% select(PatientID) %>% unique %>% nrow()` unique pediatric cancer cases. Patients were recruited at Ghent University Hospital (n = `r sample_annotation %>% filter(SampleOrigin == "UZG") %>% select(PatientID) %>% unique %>% nrow()`), Princess Máxima Center (n = `r sample_annotation %>% filter(SampleOrigin == "PMC") %>% select(PatientID) %>% unique %>% nrow()`), Institut Curie (n = `r sample_annotation %>% filter(SampleOrigin == "CURIE") %>% select(PatientID) %>% unique %>% nrow()`) and University Hospital Motol (n = `r sample_annotation %>% filter(SampleOrigin == "MH") %>% select(PatientID) %>% unique %>% nrow()`). In total, the cohort comprised Ewing sarcoma (n = `r sample_annotation %>% filter(TumorType == "Ewing sarcoma") %>% select(PatientID) %>% unique %>% nrow()`), osteosarcoma (n = `r sample_annotation %>% filter(TumorType == "osteosarcoma") %>% select(PatientID) %>% unique %>% nrow()`), rhabdomyosarcoma (n = `r sample_annotation %>% filter(TumorType == "rhabdomyosarcoma") %>% select(PatientID) %>% unique %>% nrow()`), nephroblastoma (n = `r sample_annotation %>% filter(TumorType == "nephroblastoma") %>% select(PatientID) %>% unique %>% nrow()`), neuroblastoma (n = `r sample_annotation %>% filter(TumorType == "neuroblastoma") %>% select(PatientID) %>% unique %>% nrow()`) and brain tumor samples (n = `r sample_annotation %>% filter(TumorGroup == "brain tumor") %>% select(PatientID) %>% unique %>% nrow()`). More detailed sample information is summarized in supplementary table X. From these `r sample_annotation %>% select(PatientID) %>% unique %>% nrow()` patients, copy number aberrations (CNAs) were measured in plasma with shallow whole genome sequencing (sWGS) in all samples, while on tissue this was done either with sWGS (n = `r sample_annotation %>% filter(tumorDNA_assay_detail == "sWGS") %>% select(tumorDNA_ID) %>% unique %>% nrow()`), WES (n = `r sample_annotation %>% filter(tumorDNA_assay_detail == "WES") %>% select(tumorDNA_ID) %>% unique %>% nrow()`) or array CGH (n = `r sample_annotation %>% filter(tumorDNA_assay_detail != "sWGS" & tumorDNA_assay_detail != "WES"  ) %>% select(UniqueID) %>% unique %>% nrow()`) (figure 1 and all comparative plots are available in supplementary figures 2). 
+
+<!-- In case of sWGS, `r round((mapped_reads %>% filter(biomaterial == "cfDNA") %>% pull(raw_total_sequences) %>% median())/1e6,2)`M [`r (mapped_reads %>% filter(biomaterial == "cfDNA") %>% pull(raw_total_sequences) %>% quantile())[2]`-`r (mapped_reads %>% filter(biomaterial == "cfDNA") %>% pull(raw_total_sequences) %>% quantile())[4]`] reads were generated for cfDNA and `r round((mapped_reads %>% filter(biomaterial == "tumor DNA") %>% pull(raw_total_sequences) %>% median())/1e6,2)`M [`r (mapped_reads %>% filter(biomaterial == "tumor DNA") %>% pull(raw_total_sequences) %>% quantile())[2]`-`r (mapped_reads %>% filter(biomaterial == "tumor DNA") %>% pull(raw_total_sequences) %>% quantile())[4]`] for tissue DNA, with `r round((duplicated_reads %>% filter(biomaterial == "cfDNA") %>% pull(duplicate_percentage) %>% median()),2)`% [`r (duplicated_reads %>% filter(biomaterial == "cfDNA") %>% pull(duplicate_percentage) %>% quantile())[2]`-`r (duplicated_reads %>% filter(biomaterial == "cfDNA") %>% pull(duplicate_percentage) %>% quantile())[4]`] and `r round((duplicated_reads %>% filter(biomaterial == "tumor DNA") %>% pull(duplicate_percentage) %>% median()),2)`% duplicate reads [`r (duplicated_reads %>% filter(biomaterial == "tumor DNA") %>% pull(duplicate_percentage) %>% quantile())[2]`-`r (duplicated_reads %>% filter(biomaterial == "tumor DNA") %>% pull(duplicate_percentage) %>% quantile())[4]`], respectively. -->
+  
+  
+  **Copy number abnormality score is higher in tumor tissue than in plasma.** For every sample, the modified copy number profile abnormality (CPAm) score was calculated to quantify and to allow comparison of copy number tumor burden in tumor DNA and cfDNA (see Methods for details, see figure ##2A and ##2B for an illustration of the relationship between the genome-wide copy number profile and the CPAm score). The median CPAm across all tumor types was found to be `r median(cfDNAvsTissue$cpa_cfDNA)` [`r quantile(cfDNAvsTissue$cpa_cfDNA)[2]`-`r quantile(cfDNAvsTissue$cpa_cfDNA)[4]`] in cfDNA and `r median(cfDNAvsTissue$cpa_tumorDNA)` [`r quantile(cfDNAvsTissue$cpa_tumorDNA)[2]`-`r quantile(cfDNAvsTissue$cpa_tumorDNA)[4]`]  in tissue DNA (figure ###4B illustrates the CPAm score per tumor type). Based on manual inspection (tissue DNA) or the previously established 1% FDR threshold for CPAm (cfDNA, see Methods), we found that `r cfDNAvsTissue %>% filter(CNA_cfDNA == "flat") %>% pull(CNA_cfDNA) %>% length()` (`r 100*cfDNAvsTissue %>% filter(CNA_cfDNA == "flat") %>% pull(CNA_cfDNA) %>% length() / cfDNAvsTissue %>% filter(CNA_cfDNA == "CNA" | CNA_cfDNA == "flat" ) %>% pull(CNA_cfDNA) %>% length()`%) cfDNA samples and `r (cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "FALSE") %>% pull(tumorDNA_CNAs_consensus) %>% length())` (`r  100*(cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "FALSE") %>% pull(tumorDNA_CNAs_consensus) %>% length()) / (cfDNAvsTissue %>% pull(tumorDNA_CNAs_consensus) %>% length())`%) tumor samples were labeled as “flat”, i.e., copy number neutral.  
+                                                                                                                                                                                                                                                                 
+**cfDNA sample quality and disease extent determines concordance between cfDNA and tissue DNA.** Previous studies have pointed at a substantial influence of cfDNA sample quality on the detection of tumor-derived DNA in cfDNA (ADD REFS). We assessed the cfDNA quality by determining the ratio of cfDNA (< 700 bp) vs. high molecular weight (> 700 bp) (i.e. cfDNA/HMW ratio) for `r cfDNAvsTissue %>% filter(!is.na(cfDNA_HMW_ratio)) %>% nrow()` samples (`r median(cfDNAvsTissue$cfDNA_HMW_ratio, na.rm = TRUE)` [`r quantile(cfDNAvsTissue$cfDNA_HMW_ratio, na.rm = TRUE)[2]`-`r quantile(cfDNAvsTissue$cfDNA_HMW_ratio, na.rm = TRUE)[4]`], figure ##1 and supplemental figures #XX). For every cfDNA-tissue pair, the Pearson R and the CPAm score (see Methods) was calculated and associated with the cfDNA/HMW ratio (figure XX, supplemental figures XX). 
+                                                                                                                                                                              The median cfDNA/HMW ratio of copy number neutral cfDNA samples was `r cfDNAvsTissue %>% filter(CNA_cfDNA == "flat") %>% pull(cfDNA_HMW_ratio ) %>% median(na.rm = TRUE)` [`r quantile(cfDNAvsTissue %>% filter(CNA_cfDNA == "flat") %>% pull(cfDNA_HMW_ratio ), na.rm = TRUE)[2]` - `r quantile(cfDNAvsTissue %>% filter(CNA_cfDNA == "flat") %>% pull(cfDNA_HMW_ratio ),na.rm = TRUE)[4]`] versus `r cfDNAvsTissue %>% filter(CNA_cfDNA == "CNA") %>% pull(cfDNA_HMW_ratio ) %>% median(na.rm = TRUE)` [`r (cfDNAvsTissue %>% filter(CNA_cfDNA == "CNA") %>% pull(cfDNA_HMW_ratio ) %>% quantile(na.rm = TRUE))[2]` - `r (cfDNAvsTissue %>% filter(CNA_cfDNA == "CNA") %>% pull(cfDNA_HMW_ratio ) %>% quantile(na.rm = TRUE))[4]`] for samples above the 1% FDR threshold (p < `r wilcox.test(cfDNAvsTissue %>% filter(CNA_cfDNA == "CNA") %>% pull(cfDNA_HMW_ratio ), cfDNAvsTissue %>% filter(CNA_cfDNA == "flat") %>% pull(cfDNA_HMW_ratio ))[3]`, Wilcoxon Rank Sum test).
+                                                                                                                                                                              
+  In Figure XX, we observed an apparent association of cfDNA/HMW ratio and the tissue assay (i.e. Illumina BeadChip, sWGS, WES) on the copy number burden in cfDNA. Subsequently, we more deeply investigated the effect of these parameters on the agreement between the tissue CNAs and cfDNA CNAs. Using a generalized additive model (GAM), we found that a higher cfDNA/HMW ratio (after log10 transformation) was associated with a better agreement between tissue CNA and cfDNA CNAs (p < `r summary(Model)$p.pv["L2R_tumorDNA:cfDNA_HMW_ratio_log10"] + 0.001`), after adjusting for tumor type, disease extent and the platform on which the tissue copy number was determined (e.g. sWGS or Illumina BeadChip, full model in supplemental data X). Based on previously-defined thresholds (ref epigenetics), we found that on a total of `r cfDNAvsTissue %>% filter(!is.na(cfDNA_HMW_ratio)) %>% select(PatientID) %>% nrow()` samples, the `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% nrow()` samples with a cfDNA/HMW ratio lower than 1 (low quality) contained `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% filter(CNA_cfDNA == 'flat') %>% nrow()` (`r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% filter(CNA_cfDNA == 'flat') %>% nrow() / cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% nrow() *100`%) copy number neutral samples in cfDNA while of these `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% filter(CNA_cfDNA == 'flat') %>% nrow()` cfDNA neutral samples, there were `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% filter(tumorDNA_CNAs_consensus == 'TRUE') %>% nrow()`/ `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio < 1) %>% nrow()` samples with CNAs in the tumor. Of `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 1 & cfDNA_HMW_ratio < 5) %>% nrow()` samples with a ratio between 1 and 5 (intermediate quality) `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 1 & cfDNA_HMW_ratio < 5) %>% filter(CNA_cfDNA == 'flat') %>% nrow()` (`r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 1 & cfDNA_HMW_ratio < 5) %>% filter(CNA_cfDNA == 'flat') %>% nrow() / cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 1 & cfDNA_HMW_ratio < 5) %>% nrow() *100`%) were copy number neutral (all corresponding tumor samples contained CNAs). Finally, of `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 5) %>% nrow()` cfDNA samples with a ratio more than 5 (high quality), only `r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 5) %>% filter(CNA_cfDNA == 'flat') %>% nrow()` (`r cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 5) %>% filter(CNA_cfDNA == 'flat') %>% nrow() / cfDNAvsTissue %>% filter(cfDNA_HMW_ratio >= 5) %>% nrow() *100`%) were copy number neutral. Upon closer inspection of these three cases, the tumor was also copy number neutral in one (patient 008) and contained segmental aberrations in the other two cases (patient 044, patient 206). Overall, disagreement (i.e. tissue DNA containing CNAs while the plasma does not or vice versa) was seen in `r cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "TRUE" & CNA_cfDNA == 'flat') %>% nrow()` samples and `r cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "FALSE" & CNA_cfDNA == 'CNA') %>% nrow()` samples, respectively. The cfDNA/HMW ratio in these `r cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "FALSE" & CNA_cfDNA == 'CNA') %>% nrow() + cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "TRUE" & CNA_cfDNA == 'flat') %>% nrow()` discordant samples is  `r round((cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "TRUE" & CNA_cfDNA == 'flat' | tumorDNA_CNAs_consensus == "FALSE" & CNA_cfDNA == 'CNA')  %>% pull(cfDNA_HMW_ratio) %>% median(na.rm = TRUE)),2)` [`r (cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "TRUE" & CNA_cfDNA == 'flat' | tumorDNA_CNAs_consensus == "FALSE" & CNA_cfDNA == 'CNA')  %>% pull(cfDNA_HMW_ratio) %>% quantile(na.rm = TRUE))[2]`-`r (cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "TRUE" & CNA_cfDNA == 'flat' | tumorDNA_CNAs_consensus == "FALSE" & CNA_cfDNA == 'CNA')  %>% pull(cfDNA_HMW_ratio) %>% quantile(na.rm = TRUE))[4]`], while the ratio in the concordant samples is  `r round((cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "FALSE" & CNA_cfDNA == 'flat' | tumorDNA_CNAs_consensus == "TRUE" & CNA_cfDNA == 'CNA')  %>% pull(cfDNA_HMW_ratio) %>% median(na.rm = TRUE)),2)` [`r (cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "TRUE" & CNA_cfDNA == 'CNA' | tumorDNA_CNAs_consensus == "FALSE" & CNA_cfDNA == 'flat')  %>% pull(cfDNA_HMW_ratio) %>% quantile(na.rm = TRUE))[2]`-`r (cfDNAvsTissue %>% filter(tumorDNA_CNAs_consensus == "FALSE" & CNA_cfDNA == 'flat' | tumorDNA_CNAs_consensus == "TRUE" & CNA_cfDNA == 'CNA')  %>% pull(cfDNA_HMW_ratio) %>% quantile(na.rm = TRUE))[4]`].
+Furthermore, based on the GAM, patients with metastatic disease had a higher agreements between the log2(ratio) in cfDNA and log2(ratio) in tissue DNA. 
+
+**Characterisation of spatial heterogeneity and subclones in tumor samples.** For two nephroblastoma cases, cfDNA was available at diagnosis and tumor tissue after treatment (patient XX and patient XX). Patient `r sample_annotation %>% filter(tumorDNA_ID == "2S88") %>% pull(PatientID) %>% gsub("patient_0", "", .)` and `r sample_annotation %>% filter(tumorDNA_ID == "2G07") %>% pull(PatientID) %>% gsub("patient_0", "", .)` were treated according to the SIOP Wilms tumor protocol for nephroblastoma (ADDS REFS). Plasma samples from these two patients were obtained before initiation of chemotherapy and tissue samples were obtained after 4 weeks of neoadjuvant chemotherapy. After resection, the copy number profile was determined in three different locations in the resected kidney and compared to the pre-treatment plasma sample (figure XXX2C), which revealed substantial intra-tumor difference and discordance with cfDNA (e.g. patient `r sample_annotation %>% filter(tumorDNA_ID == "2S88") %>% pull(PatientID) %>% gsub("patient_0", "", .)`, gain on chr12, patient `r sample_annotation %>% filter(tumorDNA_ID == "2G07") %>% pull(PatientID) %>% gsub("patient_0", "", .)` both present in cfDNA but not in all tumor sections, figure 2C). For patient `r sample_annotation %>% filter(tumorDNA_ID == "2S88") %>% pull(PatientID) %>% gsub("patient_0", "", .)`, histologic evaluation for locations 1 and 2 was determined to be triphasic nephroblastoma with necrosis and location 3 was kidney with blastema. For patient `r sample_annotation %>% filter(tumorDNA_ID == "2G07") %>% pull(PatientID) %>% gsub("patient_0", "", .)`, locations 1 and 3 were determined to be triphasic nephroblastoma with rhabdomyoblastic differentiation and location 2 was necrotic tissue. Importantly, gain of 1q, a prognostic biomarker in Wilms tumor (https://pubmed.ncbi.nlm.nih.gov/27432915/), was only observed in location 1 of patient `r sample_annotation %>% filter(tumorDNA_ID == "2S88") %>% pull(PatientID) %>% gsub("patient_0", "", .)` and location 2 and 3 of patient `r sample_annotation %>% filter(tumorDNA_ID == "2G07") %>% pull(PatientID) %>% gsub("patient_0", "", .)`, while not in cfDNA at diagnosis.
+
+**Certain CNAs can be present only in cfDNA or tissue DNA.** Several samples, of moderate to high quality (cfDNA/HMW ratio above 1) and with a high CPAm (more than 3 times the CPAm at the 1% FDR threshold) in cfDNA were observed to have a low Pearson correlation coefficient of cfDNA and tissue DNA log2(ratio) (e.g. patient 079, patient 212, patient 077, patient 196). Upon closer inspection, several aberrations are discordant between plasma and tissue DNA in those cases (patient 077, patient 079, patient 196, figure XXX). In one case (patient 212), only the amplification of MYCN on 2p24.3 could be detected in the tissue DNA while analysis of the cfDNA samples showed that many more CNAs were present (figure XXX). Furthermore, other discordant samples were seen upon manual inspection, albeit with smaller and more subtle differences. In three neuroblastoma cases (patient 185, 136, 109) recurrent segmental CNAs (1p deletion, 2p gain, 11q deletion and 17q gain) were more clearly present in the cfDNA than in the tissue DNA. For several nephroblastoma cases (e.g. patient 035 and 056), chromosomal aberrations were identified in the cfDNA and not in the tissue DNA. 
+
+**cfDNA is complementary to tissue DNA in the risk stratification of neuroblastoma and nephroblastoma.** As *MYCN* amplification is an important prognostic biomarker in neuroblastoma, we investigated agreement between *MYCN* gain/amplification between cfDNA and tissue DNA. On all samples (irrespective of the sample quality) (n = `r MYCN %>% nrow()`), *MYCN* calls were similar in cfDNA and tissue DNA without any discrepancies. In nephroblastoma, relying on cfDNA for determining the presence of 1q gain, a prognostic marker (ADD REF), `r table(nephr_1q$gain_1q_WT_cfDNA, nephr_1q$gain_1q_WT_tumor)[1,2]` samples (n = `r nephr_1q %>% nrow()`) (or `r table(nephr_1q_highqual$gain_1q_WT_cfDNA, nephr_1q_highqual$gain_1q_WT_tumor)[1,2]`/`r nephr_1q_highqual %>% nrow()` when only including the intermediate to high quality samples with a cfDNA/HMW ratio above 1) with 1q gain would have been missed, while only relying on tissue DNA 1q gain would have been missed in `r table(nephr_1q$gain_1q_WT_cfDNA, nephr_1q$gain_1q_WT_tumor)[2,1]` cases. 
+
+**Cerebrospinal fluid can be the preferred option for CNA detection in medulloblastoma** For brain tumors, it is expected that higher tissue DNA fractions will be found in cerebrospinal fluid (CSF) when compared to  plasma. We analyzed `r sample_annotation %>% filter(CFD_biomaterial == "CSF") %>% pull(PatientID) %>% unique() %>% length()` CSF samples of brain tumor patients. All showed clear CNAs in the CSF (almost) fully concordant to the matching tissue DNA profile (HEATMAP FIGURE). For patient 101 with a medulloblastoma, we had a matching plasma sample available, with a cfDNA/HMW ratio of `r cfDNAvsTissue %>% filter(CFD_ID == "CFD1802291") %>% pull(cfDNA_HMW_ratio)` that presented a copy number neutral profile, while CSF depicted a chromosome 6 loss (supplemental figure XX).
